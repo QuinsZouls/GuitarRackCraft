@@ -369,15 +369,48 @@ bool PluginChain::restorePluginState(int index, const PluginState& state) {
     return ok;
 }
 
-void PluginChain::ensureBuffers(uint32_t numFrames, uint32_t numChannels) {
+void PluginChain::resizeBuffersLocked(uint32_t numFrames, uint32_t numChannels) {
     if (intermediateBuffers_.size() < numChannels) {
         intermediateBuffers_.resize(numChannels);
     }
     for (auto& buffer : intermediateBuffers_) {
         if (buffer.size() < numFrames) {
-            buffer.resize(numFrames);
+            buffer.assign(numFrames, 0.0f);
         }
     }
+    preparedFrames_ = std::max(preparedFrames_, numFrames);
+}
+
+void PluginChain::prepareBuffers(uint32_t maxFrames, uint32_t numChannels) {
+    std::unique_lock lock(chainMutex_);
+    resizeBuffersLocked(maxFrames, numChannels);
+    LOGI("prepareBuffers: %u frames x %zu channels", preparedFrames_, intermediateBuffers_.size());
+}
+
+void PluginChain::ensureBuffers(uint32_t numFrames, uint32_t numChannels) {
+    if (numFrames <= preparedFrames_ && intermediateBuffers_.size() >= numChannels) {
+        return;
+    }
+    // Should never happen: the engine sizes the buffers to the stream capacity
+    // in prepareBuffers(). Kept as a last resort so a mis-sized stream degrades
+    // into a glitch instead of reading/writing out of bounds. No lock is taken
+    // here: process() already holds the shared lock.
+    LOGI("ensureBuffers: growing to %u frames x %u channels on the audio thread "
+         "(prepareBuffers was called with %u frames)", numFrames, numChannels, preparedFrames_);
+    resizeBuffersLocked(numFrames, numChannels);
+}
+
+bool PluginChain::forEachPluginTryShared(const std::function<void(IPlugin&)>& visit) {
+    std::shared_lock lock(chainMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    for (auto& plugin : plugins_) {
+        if (plugin) {
+            visit(*plugin);
+        }
+    }
+    return true;
 }
 
 } // namespace guitarrackcraft

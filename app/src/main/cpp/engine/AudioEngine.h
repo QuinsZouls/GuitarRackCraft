@@ -22,12 +22,15 @@
 
 #include <oboe/Oboe.h>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "plugin/PluginChain.h"
 #include "AudioRecorder.h"
+#include "LatencyMath.h"
 #include "dsp/GlobalGain.h"
 
 namespace guitarrackcraft {
@@ -83,18 +86,43 @@ public:
         bool outputLowLatency = false;
         bool outputMMap = false;       // MMAP used (lowest path)
         bool outputCallback = true;    // Using data callback
-        int32_t framesPerBurst = 0;    // Hardware burst size
+        int32_t framesPerBurst = 0;    // Hardware burst size (output)
+        bool inputMMap = false;        // MMAP used by the input stream
+        int32_t inputChannels = 0;     // Granted input channel count (1 or 2)
+        int32_t outputChannels = 0;
+        int32_t inputFormat = 0;       // 0 = float, 1 = 16-bit PCM
+        int32_t outputFormat = 0;
+        int32_t inputPreset = 0;       // 0 = VoiceRecognition, 1 = VoicePerformance, 2 = other
+        int32_t outputBufferSizeInFrames = 0;   // Real buffer the HAL is using now
+        int32_t outputBufferCapacity = 0;       // Maximum the stream can use
+        int32_t outputFramesPerCallback = 0;
+        int32_t inputFramesPerBurst = 0;
+        int32_t inputBufferSizeInFrames = 0;
+        int32_t outputTimestampSupported = 0;   // 1 when getTimestamp() answered
     };
 
     /**
      * Get stream configuration info for the low-latency checklist.
      */
-    StreamInfo getStreamInfo() const;
+    StreamInfo getStreamInfo();
+
+    /** Round-trip latency broken down by direction, all values in milliseconds. */
+    struct LatencyDetails {
+        double inputMs = 0.0;
+        double outputMs = 0.0;
+        double roundTripMs = 0.0;
+    };
 
     /**
-     * Get current latency in milliseconds.
+     * Latency measured from the stream timestamps (input + output), with the
+     * queued-frames estimate as fallback when the device cannot report one.
      */
-    double getLatencyMs() const;
+    LatencyDetails getLatencyDetails();
+
+    /**
+     * Get the current round-trip latency in milliseconds (input + output).
+     */
+    double getLatencyMs();
 
     /**
      * Get input peak level (0.0–1.0).
@@ -203,6 +231,36 @@ private:
     std::atomic<bool> isRunning_;
     std::atomic<bool> chainBypass_{false};  // skip chain processing (passthrough)
 
+    // Configuration actually granted by the HAL. The negotiation ladder asks for
+    // mono float, but a device may only grant stereo or 16-bit, so the callback
+    // converts from whatever was granted instead of assuming the request.
+    int32_t inputChannels_ = 1;
+    int32_t outputChannels_ = 2;
+    bool inputFormatIsFloat_ = true;
+    bool outputFormatIsFloat_ = true;
+    /** Coarse classification of the granted input preset, for the diagnostics UI. */
+    enum class InputPresetClass : int32_t {
+        VoiceRecognition = 0,
+        VoicePerformance = 1,
+        Other = 2,
+    };
+    InputPresetClass inputPreset_ = InputPresetClass::VoiceRecognition;
+
+    // Upper bound of numFrames per callback, so nothing in the RT path allocates.
+    size_t bufferCapacityFrames_ = 0;
+
+    // Latency tuner for the output stream: shrinks the HAL buffer to the minimum
+    // and grows it back only when xruns appear. It references the stream, so
+    // closeStreams() resets it right after outputStream_ (that is, after the
+    // 500 ms wait that drains the callback thread): the member itself outlives
+    // closeStreams(), the stream it points at does not.
+    std::unique_ptr<oboe::LatencyTuner> latencyTuner_;
+
+    // Last latency computed from a valid timestamp, per direction. Only touched
+    // from the JNI/UI thread.
+    latency::LatencyHold inputLatencyHold_;
+    latency::LatencyHold outputLatencyHold_;
+
     // Global gain targets in dB (written from the UI thread, read per callback).
     // The ramp state that actually reaches the samples lives in the GlobalGain
     // instances below, which are audio-thread-only.
@@ -215,7 +273,13 @@ private:
     std::vector<float> inputBuffer_;
     std::vector<float> outputBufferLeft_;
     std::vector<float> outputBufferRight_;
-    
+
+    // Preallocated scratch for the granted-but-not-preferred stream layouts:
+    // stereo float input before the downmix, and 16-bit input (mono or stereo)
+    // before the conversion. Both are sized to bufferCapacityFrames_.
+    std::vector<float> inputStereoScratch_;
+    std::vector<int16_t> inputI16Scratch_;
+
     // Temporary buffers for plugin chain
     const float* inputPtrs_[2];
     float* outputPtrs_[2];
@@ -229,27 +293,30 @@ private:
     float inputPeakHold_{0.0f};
     float outputPeakHold_{0.0f};
 
-    // Aggregated subprocess (wine VST) load + xruns. Sampled periodically
-    // from the audio callback (every ~1s) so the UI's getCpuLoad / xrun
-    // metrics include VSTs that run out-of-process. Without this, a Helix
+    // Aggregated subprocess (wine VST) load + xruns. Sampled every ~500ms by the
+    // dedicated monitor thread (see startVstMonitor) so the UI's getCpuLoad /
+    // xrun metrics include VSTs that run out-of-process. Without this, a Helix
     // Native that's saturating the wine subprocess shows 1% CPU and 0
     // xruns because the audio thread itself is idle — the wine subprocess
     // is the bottleneck and it isn't measured here.
     std::atomic<float>   vstCpuLoad_{0.0f};
     std::atomic<int32_t> vstUnderruns_{0};
     /** Per-plugin last-sampled jiffies counter, keyed by subprocess pid.
-     *  Lives in audio-callback context — only touched at periodic-sample
-     *  cadence (not every callback). */
+     *  Owned exclusively by the monitor thread. */
     std::unordered_map<int, uint64_t> vstLastJiffies_;
-    /** Wall-time when vstLastJiffies_ was last updated (clock_gettime ns). */
+    /** Wall-time when vstLastJiffies_ was last updated (clock_gettime ns).
+     *  Owned exclusively by the monitor thread. */
     uint64_t vstLastSampleNs_{0};
-    /** Audio-callback counter so we sample subprocesses every N callbacks
-     *  (~1Hz) rather than every block — reading /proc is cheap but not
-     *  free, and the value is for human-facing UI. */
-    uint32_t vstSampleCounter_{0};
+    /** Reads /proc/<pid>/stat for the out-of-process plugins. Reading files
+     *  cannot happen on the audio thread, so this lives on its own thread. */
+    std::thread vstMonitorThread_;
+    std::atomic<bool> vstMonitorRunning_{false};
 
     static constexpr float kClippingThreshold = 0.99f;
     static constexpr float kPeakDecay = 0.95f;
+    /** Cap for the plugin chain's intermediate buffers (the engine's own buffers
+     *  follow the real stream capacity so the callback never has to grow one). */
+    static constexpr size_t kMaxBufferedFrames = 8192;
 
     // WAV playback state (read in callback; written from load/seek/play/pause)
     std::vector<float> wavBuffer_;
@@ -264,6 +331,20 @@ private:
     void closeStreams();
     void resampleToEngineRate(const std::vector<float>& src, uint32_t srcRate,
                               std::vector<float>& dst);
+
+    bool openInputStream();
+    bool openOutputStream();
+    bool startStreams();
+    void prepareBuffers();
+    void requestMinimumBufferSize(oboe::AudioStream* stream, const char* label);
+    int32_t readInputIntoBuffer(int32_t numFrames);
+    void writeOutputBuffer(void* audioData, int32_t numFrames, int32_t numChannels);
+    oboe::DataCallbackResult finishOutputCallback();
+
+    void startVstMonitor();
+    void stopVstMonitor();
+    void vstMonitorLoop();
+    void sampleVstLoad();
 };
 
 } // namespace guitarrackcraft

@@ -21,6 +21,7 @@
 #define GUITARRACKCRAFT_LV2_PLUGIN_H
 
 #include "../IPlugin.h"
+#include "LV2RTMailbox.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -75,14 +76,40 @@ public:
     /** True if the plugin binary loaded and instantiated successfully. */
     bool hasInstance() const { return instance_ != nullptr; }
 
-    /** Send a file path to the plugin via LV2 patch:Set atom message. */
+    /**
+     * Send a file path to the plugin via LV2 patch:Set atom message.
+     *
+     * Safe to call from several threads: the mailbox is single-producer by
+     * design, so the producer side (message build + push) is serialized by
+     * filePathProducerMutex_. A path that does not fit a mailbox slot is dropped
+     * and counted (getFilePathDropCount()), never truncated.
+     */
     void setFilePath(const std::string& propertyUri, const std::string& path) override;
 
-    /** Inject a raw atom message into the plugin's atom input port (for UI→DSP forwarding). */
+    /**
+     * Inject a raw atom message into the plugin's atom input port (for UI->DSP
+     * forwarding).
+     *
+     * Single producer by construction: the only caller is the LV2 UI's write
+     * callback, which PluginUIManager installs and whose UI runs on that
+     * display's single pluginUI thread. Nothing reaches this through JNI (the
+     * JNI entry points cover parameters, files and transport only), so unlike
+     * setFilePath() it needs no producer lock.
+     */
     void injectAtom(const void* data, uint32_t size) override;
 
     /** Drain queued atom events from output ports. */
     std::vector<OutputAtomEvent> drainOutputAtoms() override;
+
+    /**
+     * Entries discarded because a real-time mailbox was full. Diagnostics only:
+     * reading them is safe from any thread and they only advance on drops, so a
+     * steady zero is the expected value.
+     */
+    uint64_t getAtomDropCount() const;
+    uint64_t getWorkerResponseDropCount() const;
+    uint64_t getOutputAtomDropCount() const;
+    uint64_t getFilePathDropCount() const;
 
     /** Save complete plugin state (control ports + LV2 state:interface properties). */
     PluginState saveState() override;
@@ -128,12 +155,12 @@ private:
     int32_t maxBlockLength_ = kMaxLv2BufferFrames;
     std::vector<const LV2_Feature*> instanceFeatures_;
 
+    // The worker queue is not on the real-time path: the worker thread may
+    // block, allocate and wait, so it keeps the mutex + std::queue.
     std::thread workerThread_;
     std::mutex workerMutex_;
     std::condition_variable workerCond_;
     std::queue<std::vector<uint8_t>> workRequests_;
-    std::mutex responseMutex_;
-    std::queue<std::vector<uint8_t>> workResponses_;
     std::atomic<bool> workerRunning_{false};
 
     // Atom port buffers
@@ -145,9 +172,13 @@ private:
     };
     std::vector<std::vector<uint8_t>> atomPortBuffers_;
     std::vector<AtomPortInfo> atomPorts_;
+    static constexpr size_t kNoAtomBuffer = static_cast<size_t>(-1);
+    /** Buffer index of the first atom input port, or kNoAtomBuffer. */
+    size_t atomInputBufferIdx_ = kNoAtomBuffer;
 
     // Atom forge + patch:Set support
     LV2_Atom_Forge forge_{};
+    LV2_URID atom_Sequence_ = 0;
     LV2_URID atom_Path_ = 0;
     LV2_URID atom_URID_ = 0;
     LV2_URID patch_Set_ = 0;
@@ -155,18 +186,30 @@ private:
     LV2_URID patch_property_ = 0;
     LV2_URID patch_value_ = 0;
 
-    // Pending file path for patch:Set delivery
-    std::string pendingFilePath_;
-    std::string pendingFilePropertyUri_;
-    std::mutex filePathMutex_;
+    // Real-time mailboxes. Each one replaces a mutex + container and keeps the
+    // audio thread free of locks, allocations and blocking: see LV2RTMailbox.h
+    // and utils/SPSCRing.h. The two ends are noted per ring.
+    lv2rt::FilePathRing pendingFilePath_;      // UI -> audio
+    lv2rt::AtomRing pendingAtoms_;             // UI -> audio
+    lv2rt::ResponseRing workResponses_;        // worker -> audio
+    lv2rt::OutputAtomRing pendingOutputAtoms_; // audio -> UI
 
-    // Pending raw atom messages from UI (DPF state sync, etc.)
-    std::mutex pendingAtomMutex_;
-    std::vector<std::vector<uint8_t>> pendingAtoms_;
+    // Producer-side serialization of pendingFilePath_. setFilePath() reaches the
+    // ring from Dispatchers.Main (RackViewModel) and from Dispatchers.IO (the
+    // Tone3000 view models), and two threads inside one SPSC slot would publish
+    // a torn URID+path or lose an entry. Producer-side only: the audio thread
+    // pops that ring and never locks this, so process() stays lock-free.
+    std::mutex filePathProducerMutex_;
 
-    // Queued atom output events for UI forwarding (written by process, read by UI thread)
-    std::mutex outputAtomMutex_;
-    std::vector<OutputAtomEvent> pendingOutputAtoms_;
+    // Output atoms too big for a mailbox slot. Counted by the audio thread (one
+    // relaxed increment, no log) and folded into getOutputAtomDropCount().
+    std::atomic<uint64_t> oversizedOutputAtoms_{0};
+
+    // Input atoms that left the mailbox without reaching the plugin: a body no
+    // sequence can hold (Unrepresentable) and one that did not fit what was left
+    // of the current callback's sequence (NoRoom). Counted on the audio thread
+    // and folded into getAtomDropCount().
+    std::atomic<uint64_t> discardedInputAtoms_{0};
 
     // State extension (save/restore)
     const LV2_State_Interface* stateInterface_ = nullptr;

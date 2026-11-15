@@ -196,6 +196,7 @@ fun AudioSettingsScreen(
                 val sampleRate = remember(refreshKey) { AudioEngine.getSampleRate() }
                 val bufferFrames = remember(refreshKey) { AudioEngine.getBufferFrameCount() }
                 val streamInfo = remember(refreshKey) { AudioEngine.getStreamInfo() }
+                val latency = remember(refreshKey) { AudioEngine.getLatencyDetails() }
 
                 Divider()
                 Text(
@@ -204,9 +205,27 @@ fun AudioSettingsScreen(
                     modifier = Modifier.padding(bottom = 4.dp)
                 )
                 InfoRow("Sample Rate", "%.0f Hz".format(sampleRate))
-                InfoRow("Buffer Size", "$bufferFrames frames")
-                InfoRow("Burst Size", "${streamInfo.framesPerBurst} frames")
-                InfoRow("Audio Format", "32-bit Float")
+                InfoRow("Callback Size", "$bufferFrames frames")
+                InfoRow(
+                    "Buffer In Use",
+                    "${streamInfo.outputBufferSizeInFrames} of ${streamInfo.outputBufferCapacity} frames"
+                )
+                InfoRow(
+                    "Burst Size",
+                    "in ${streamInfo.inputFramesPerBurst} / out ${streamInfo.framesPerBurst} frames"
+                )
+                InfoRow(
+                    "Input Format",
+                    "${streamInfo.inputFormatLabel} · ${streamInfo.inputChannels} ch · " +
+                        streamInfo.inputPresetLabel
+                )
+                InfoRow(
+                    "Output Format",
+                    "${streamInfo.outputFormatLabel} · ${streamInfo.outputChannels} ch"
+                )
+                InfoRow("Latency input", "%.1f ms".format(latency.inputMs))
+                InfoRow("Latency output", "%.1f ms".format(latency.outputMs))
+                InfoRow("Round-trip", "%.1f ms".format(latency.roundTripMs))
 
                 Spacer(modifier = Modifier.height(4.dp))
                 Divider()
@@ -229,11 +248,36 @@ fun AudioSettingsScreen(
                 ChecklistItem("Sharing: Exclusive (input)", streamInfo.inputExclusive, "Shared")
                 ChecklistItem("Sample rate: 48000 Hz", sampleRate.toInt() == 48000, "%.0f Hz".format(sampleRate))
                 ChecklistItem("Data callback", streamInfo.outputCallback)
-                ChecklistItem("MMAP buffer", streamInfo.outputMMap)
+                ChecklistItem("MMAP buffer (output)", streamInfo.outputMMap)
+                ChecklistItem("MMAP buffer (input)", streamInfo.inputMMap)
+                ChecklistItem(
+                    "Timestamp latency (output)",
+                    streamInfo.outputTimestampSupported,
+                    "queued-frames estimate"
+                )
+
+                if (streamInfo.usesLegacyPath) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = legacyPathHint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }
 }
+
+/**
+ * Shown when the HAL did not grant Exclusive + MMAP on both streams. Those are
+ * the two properties that make the difference between a ~10 ms and a ~40 ms
+ * round trip, and they are lost to other apps holding the device or to
+ * system-wide audio effects.
+ */
+private const val legacyPathHint =
+    "The HAL did not grant the lowest-latency path on both streams. Close other audio " +
+        "apps, disable touch sounds / Dolby Atmos, then restart the engine."
 
 @Composable
 private fun GlobalGainSetting(

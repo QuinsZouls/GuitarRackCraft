@@ -22,6 +22,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <vector>
 #include <memory>
 #include <shared_mutex>
@@ -67,15 +68,38 @@ public:
     /** Expose chain mutex so UI code can take a shared_lock during port reads. */
     std::shared_mutex* getChainMutex() { return &chainMutex_; }
 
+    /**
+     * Preallocate the intermediate buffers for the largest block the chain will
+     * ever see. Called after the streams are created so the audio callback never
+     * has to resize (a resize in the RT thread means malloc + a memcpy of the
+     * whole channel, audible as a glitch and not acceptable).
+     */
+    void prepareBuffers(uint32_t maxFrames, uint32_t numChannels = 2);
+
+    /**
+     * Runs `visit` for every plugin while holding the chain's shared lock.
+     * The lock is taken with try_lock: when a plugin is being added, removed or
+     * reordered the visit is skipped entirely and the call returns false.
+     * Intended for non-real-time monitors, never for the audio callback (which
+     * relies on its own try_lock in process()).
+     */
+    bool forEachPluginTryShared(const std::function<void(IPlugin&)>& visit);
+
 private:
     std::vector<std::unique_ptr<IPlugin>> plugins_;
     mutable std::shared_mutex chainMutex_;
 
     float sampleRate_ = 0.0f;
     uint32_t bufferSize_ = 0;
+    /** Largest block the intermediate buffers were sized for (0 = not prepared). */
+    uint32_t preparedFrames_ = 0;
 
     std::vector<std::vector<float>> intermediateBuffers_;
     void ensureBuffers(uint32_t numFrames, uint32_t numChannels);
+    /** Grows the buffers. Caller must already hold the chain lock (either mode)
+     *  — process() calls ensureBuffers() with a shared lock held, so it cannot
+     *  take the lock again here. */
+    void resizeBuffersLocked(uint32_t numFrames, uint32_t numChannels);
 
     std::deque<std::unique_ptr<IPlugin>> teardownQueue_;
     std::mutex teardownMutex_;

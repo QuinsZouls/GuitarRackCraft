@@ -33,6 +33,7 @@ object AudioEngine {
     fun getBufferFrameCount(): Int = native.getBufferFrameCount()
     fun getStreamInfo(): AudioStreamInfo = native.getStreamInfo()
     fun getLatencyMs(): Double = native.getLatencyMs()
+    fun getLatencyDetails(): LatencyDetails = native.getLatencyDetails()
 
     fun getInputLevel(): Float = native.getInputLevel()
     fun getOutputLevel(): Float = native.getOutputLevel()

@@ -423,10 +423,22 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeGetBufferFrameCount(J
     return static_cast<jint>(g_ctx->audioEngine->getCallbackFrameCount());
 }
 
+/*
+ * Stream diagnostics, one IntArray[20]:
+ *  [0]  aaAudio backend   [1]  input exclusive   [2]  output exclusive
+ *  [3]  input low latency [4]  output low latency [5] output MMAP
+ *  [6]  output callback   [7]  output burst      [8]  input MMAP
+ *  [9]  input channels    [10] output channels   [11] input format (0=float,1=i16)
+ *  [12] output format     [13] input preset (0=VoiceRecognition,1=VoicePerformance,2=other)
+ *  [14] output buffer size in frames   [15] output buffer capacity
+ *  [16] output frames per callback     [17] input burst
+ *  [18] input buffer size in frames    [19] output timestamp supported
+ */
+constexpr int kStreamInfoFieldCount = 20;
+
 JNIEXPORT jintArray JNICALL
 Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeGetStreamInfo(JNIEnv* env, jobject thiz) {
-    // Returns [isAAudio, inputExclusive, outputExclusive, inputLowLatency, outputLowLatency, outputMMap, outputCallback, framesPerBurst]
-    jint arr[8] = {};
+    jint arr[kStreamInfoFieldCount] = {};
     if (g_ctx->audioEngine && g_ctx->audioEngine->isRunning()) {
         auto info = g_ctx->audioEngine->getStreamInfo();
         arr[0] = info.isAAudio ? 1 : 0;
@@ -437,10 +449,22 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeGetStreamInfo(JNIEnv*
         arr[5] = info.outputMMap ? 1 : 0;
         arr[6] = info.outputCallback ? 1 : 0;
         arr[7] = info.framesPerBurst;
+        arr[8] = info.inputMMap ? 1 : 0;
+        arr[9] = info.inputChannels;
+        arr[10] = info.outputChannels;
+        arr[11] = info.inputFormat;
+        arr[12] = info.outputFormat;
+        arr[13] = info.inputPreset;
+        arr[14] = info.outputBufferSizeInFrames;
+        arr[15] = info.outputBufferCapacity;
+        arr[16] = info.outputFramesPerCallback;
+        arr[17] = info.inputFramesPerBurst;
+        arr[18] = info.inputBufferSizeInFrames;
+        arr[19] = info.outputTimestampSupported;
     }
-    jintArray result = env->NewIntArray(8);
+    jintArray result = env->NewIntArray(kStreamInfoFieldCount);
     if (result) {
-        env->SetIntArrayRegion(result, 0, 8, arr);
+        env->SetIntArrayRegion(result, 0, kStreamInfoFieldCount, arr);
     }
     return result;
 }
@@ -451,6 +475,23 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeGetLatencyMs(JNIEnv* 
         return 0.0;
     }
     return g_ctx->audioEngine->getLatencyMs();
+}
+
+/** Round-trip latency breakdown: [input ms, output ms, round-trip ms]. */
+JNIEXPORT jdoubleArray JNICALL
+Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeGetLatencyDetails(JNIEnv* env, jobject thiz) {
+    jdouble values[3] = {0.0, 0.0, 0.0};
+    if (g_ctx->audioEngine && g_ctx->audioEngine->isRunning()) {
+        auto details = g_ctx->audioEngine->getLatencyDetails();
+        values[0] = details.inputMs;
+        values[1] = details.outputMs;
+        values[2] = details.roundTripMs;
+    }
+    jdoubleArray result = env->NewDoubleArray(3);
+    if (result) {
+        env->SetDoubleArrayRegion(result, 0, 3, values);
+    }
+    return result;
 }
 
 JNIEXPORT jfloat JNICALL

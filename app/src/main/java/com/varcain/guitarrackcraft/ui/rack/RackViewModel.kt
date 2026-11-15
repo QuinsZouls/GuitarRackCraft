@@ -25,6 +25,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.varcain.guitarrackcraft.engine.AudioEngine
 import com.varcain.guitarrackcraft.engine.AudioSettingsManager
+import com.varcain.guitarrackcraft.engine.LatencyDetails
 import com.varcain.guitarrackcraft.engine.NativeEngine
 import com.varcain.guitarrackcraft.engine.PresetManager
 import com.varcain.guitarrackcraft.engine.RackManager
@@ -60,8 +61,13 @@ class RackViewModel(application: Application) : AndroidViewModel(application) {
     private val _isEngineRunning = MutableStateFlow(false)
     val isEngineRunning: StateFlow<Boolean> = _isEngineRunning.asStateFlow()
 
+    /** Round-trip latency, averaged over the last second. */
     private val _latencyMs = MutableStateFlow(0.0)
     val latencyMs: StateFlow<Double> = _latencyMs.asStateFlow()
+
+    /** Same average, broken down into the input and output halves. */
+    private val _latencyDetails = MutableStateFlow(LatencyDetails())
+    val latencyDetails: StateFlow<LatencyDetails> = _latencyDetails.asStateFlow()
 
     private val _inputLevel = MutableStateFlow(0f)
     val inputLevel: StateFlow<Float> = _inputLevel.asStateFlow()
@@ -149,7 +155,9 @@ class RackViewModel(application: Application) : AndroidViewModel(application) {
         // Poll meters when engine is running
         viewModelScope.launch {
             var cpuSum = 0f
-            var latencySum = 0.0
+            var inputLatencySum = 0.0
+            var outputLatencySum = 0.0
+            var roundTripSum = 0.0
             var sampleCount = 0
             while (true) {
                 if (_isEngineRunning.value) {
@@ -159,14 +167,24 @@ class RackViewModel(application: Application) : AndroidViewModel(application) {
                         _inputClipping.value = AudioEngine.isInputClipping()
                         _outputClipping.value = AudioEngine.isOutputClipping()
                         cpuSum += AudioEngine.getCpuLoad()
-                        latencySum += AudioEngine.getLatencyMs()
+                        val latency = AudioEngine.getLatencyDetails()
+                        inputLatencySum += latency.inputMs
+                        outputLatencySum += latency.outputMs
+                        roundTripSum += latency.roundTripMs
                         sampleCount++
                         if (sampleCount >= 20) { // ~1 second (20 × 50ms)
                             _cpuLoad.value = cpuSum / sampleCount
-                            _latencyMs.value = latencySum / sampleCount
+                            _latencyMs.value = roundTripSum / sampleCount
+                            _latencyDetails.value = LatencyDetails(
+                                inputMs = inputLatencySum / sampleCount,
+                                outputMs = outputLatencySum / sampleCount,
+                                roundTripMs = roundTripSum / sampleCount
+                            )
                             _xRunCount.value = AudioEngine.getXRunCount()
                             cpuSum = 0f
-                            latencySum = 0.0
+                            inputLatencySum = 0.0
+                            outputLatencySum = 0.0
+                            roundTripSum = 0.0
                             sampleCount = 0
                         }
                         // Poll recording duration
@@ -176,7 +194,9 @@ class RackViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (_: Exception) { }
                 } else {
                     cpuSum = 0f
-                    latencySum = 0.0
+                    inputLatencySum = 0.0
+                    outputLatencySum = 0.0
+                    roundTripSum = 0.0
                     sampleCount = 0
                 }
                 delay(50)

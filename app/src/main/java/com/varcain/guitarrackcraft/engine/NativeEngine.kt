@@ -22,6 +22,11 @@ package com.varcain.guitarrackcraft.engine
 import android.content.Context
 import java.io.File
 
+/**
+ * Configuration actually granted by the audio HAL, as reported by
+ * `nativeGetStreamInfo`. Every field has a safe default so an engine that is
+ * not running (or an older native library) still produces a usable object.
+ */
 data class AudioStreamInfo(
     val isAAudio: Boolean = false,
     val inputExclusive: Boolean = false,
@@ -30,8 +35,111 @@ data class AudioStreamInfo(
     val outputLowLatency: Boolean = false,
     val outputMMap: Boolean = false,
     val outputCallback: Boolean = false,
-    val framesPerBurst: Int = 0
-)
+    val framesPerBurst: Int = 0,
+    val inputMMap: Boolean = false,
+    val inputChannels: Int = 0,
+    val outputChannels: Int = 0,
+    val inputFormat: Int = FORMAT_FLOAT,
+    val outputFormat: Int = FORMAT_FLOAT,
+    val inputPreset: Int = PRESET_OTHER,
+    val outputBufferSizeInFrames: Int = 0,
+    val outputBufferCapacity: Int = 0,
+    val outputFramesPerCallback: Int = 0,
+    val inputFramesPerBurst: Int = 0,
+    val inputBufferSizeInFrames: Int = 0,
+    val outputTimestampSupported: Boolean = false
+) {
+    val inputFormatLabel: String
+        get() = formatLabel(inputFormat)
+
+    val outputFormatLabel: String
+        get() = formatLabel(outputFormat)
+
+    val inputPresetLabel: String
+        get() = when (inputPreset) {
+            PRESET_VOICE_RECOGNITION -> "Voice Recognition"
+            PRESET_VOICE_PERFORMANCE -> "Voice Performance"
+            else -> "Other"
+        }
+
+    /** True when neither stream reached the lowest-latency path; the UI shows a hint then. */
+    val usesLegacyPath: Boolean
+        get() = !outputExclusive || !outputMMap || !inputExclusive || !inputMMap
+
+    companion object {
+        const val FORMAT_FLOAT = 0
+        const val FORMAT_I16 = 1
+
+        const val PRESET_VOICE_RECOGNITION = 0
+        const val PRESET_VOICE_PERFORMANCE = 1
+        const val PRESET_OTHER = 2
+
+        /** Field count of the native `nativeGetStreamInfo` array. */
+        const val FIELD_COUNT = 20
+
+        fun formatLabel(format: Int): String = when (format) {
+            FORMAT_FLOAT -> "32-bit Float"
+            FORMAT_I16 -> "16-bit PCM"
+            else -> "Unknown"
+        }
+
+        /**
+         * Maps the native array. A short array is tolerated (missing fields keep
+         * their defaults) so a version mismatch between the APK and the native
+         * library can never crash the settings screen.
+         */
+        fun fromArray(values: IntArray?): AudioStreamInfo {
+            if (values == null) return AudioStreamInfo()
+            fun field(index: Int) = if (index < values.size) values[index] else 0
+            return AudioStreamInfo(
+                isAAudio = field(0) != 0,
+                inputExclusive = field(1) != 0,
+                outputExclusive = field(2) != 0,
+                inputLowLatency = field(3) != 0,
+                outputLowLatency = field(4) != 0,
+                outputMMap = field(5) != 0,
+                outputCallback = field(6) != 0,
+                framesPerBurst = field(7),
+                inputMMap = field(8) != 0,
+                inputChannels = field(9),
+                outputChannels = field(10),
+                inputFormat = field(11),
+                outputFormat = field(12),
+                inputPreset = field(13),
+                outputBufferSizeInFrames = field(14),
+                outputBufferCapacity = field(15),
+                outputFramesPerCallback = field(16),
+                inputFramesPerBurst = field(17),
+                inputBufferSizeInFrames = field(18),
+                outputTimestampSupported = field(19) != 0
+            )
+        }
+    }
+}
+
+/**
+ * Round-trip latency from the stream timestamps, in milliseconds.
+ * `roundTripMs` is the number the top bar shows: what the player actually feels.
+ */
+data class LatencyDetails(
+    val inputMs: Double = 0.0,
+    val outputMs: Double = 0.0,
+    val roundTripMs: Double = 0.0
+) {
+    companion object {
+        const val FIELD_COUNT = 3
+
+        fun fromArray(values: DoubleArray?): LatencyDetails {
+            if (values == null) return LatencyDetails()
+            fun field(index: Int) = if (index < values.size) values[index] else 0.0
+            return LatencyDetails(
+                inputMs = field(0),
+                outputMs = field(1),
+                roundTripMs = field(2)
+            )
+        }
+    }
+}
 
 /**
  * JNI bridge to the native audio engine.
@@ -141,14 +249,19 @@ class NativeEngine private constructor() {
 
     /**
      * Get stream info for low-latency checklist.
-     * Returns [isAAudio, inputExclusive, outputExclusive, inputLowLatency, outputLowLatency, outputMMap, outputCallback, framesPerBurst]
+     * Returns 20 fields, see [AudioStreamInfo.fromArray].
      */
     external fun nativeGetStreamInfo(): IntArray
 
     /**
-     * Get current audio latency in milliseconds.
+     * Get the current round-trip latency in milliseconds (input + output).
      */
     external fun nativeGetLatencyMs(): Double
+
+    /**
+     * Get the latency breakdown: [input ms, output ms, round-trip ms].
+     */
+    external fun nativeGetLatencyDetails(): DoubleArray
 
     /**
      * Get input peak level (0.0–1.0).
@@ -457,23 +570,13 @@ class NativeEngine private constructor() {
 
     fun getSampleRate(): Float = nativeGetSampleRate()
     fun getBufferFrameCount(): Int = nativeGetBufferFrameCount()
-    fun getStreamInfo(): AudioStreamInfo {
-        val arr = nativeGetStreamInfo()
-        return AudioStreamInfo(
-            isAAudio = arr[0] != 0,
-            inputExclusive = arr[1] != 0,
-            outputExclusive = arr[2] != 0,
-            inputLowLatency = arr[3] != 0,
-            outputLowLatency = arr[4] != 0,
-            outputMMap = arr[5] != 0,
-            outputCallback = arr[6] != 0,
-            framesPerBurst = arr[7]
-        )
-    }
+    fun getStreamInfo(): AudioStreamInfo = AudioStreamInfo.fromArray(nativeGetStreamInfo())
 
     fun getLatencyMs(): Double {
         return nativeGetLatencyMs()
     }
+
+    fun getLatencyDetails(): LatencyDetails = LatencyDetails.fromArray(nativeGetLatencyDetails())
 
     fun getInputLevel(): Float = nativeGetInputLevel()
     fun getOutputLevel(): Float = nativeGetOutputLevel()

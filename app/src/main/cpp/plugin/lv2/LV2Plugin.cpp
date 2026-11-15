@@ -34,6 +34,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #if defined(HAVE_LV2) && HAVE_LV2 == 1
+#include "LV2AtomInput.h"
 #include <lilv/lilv.h>
 #include <lv2/urid/urid.h>
 #include <lv2/atom/util.h>
@@ -134,7 +135,9 @@ void LV2Plugin::buildFeatures() {
     // Initialize atom forge
     lv2_atom_forge_init(&forge_, &globalLv2UridMap);
 
-    // Map patch/atom URIDs
+    // Map patch/atom URIDs. Mapping takes the global map's mutex, so every URID
+    // the audio thread needs is resolved here and cached in a member.
+    atom_Sequence_ = uridMap.map(LV2_ATOM__Sequence);
     atom_Path_ = uridMap.map(LV2_ATOM__Path);
     atom_URID_ = uridMap.map(LV2_ATOM__URID);
     patch_Set_ = uridMap.map(LV2_PATCH__Set);
@@ -272,6 +275,10 @@ void LV2Plugin::activate(float sampleRate, uint32_t bufferSize) {
             std::this_thread::yield();
         }
         stopWorker();
+        // The old instance is about to go away and a pending response may carry
+        // a pointer into it. process() is idle here (the wait above), which is
+        // the only moment the audio side of the ring is.
+        workResponses_.clear();
         lilv_instance_free(instance_);
         instance_ = nullptr;
     }
@@ -328,6 +335,11 @@ void LV2Plugin::deactivate() {
 
     stopWorker();
 
+    // Safe here and only here: no process() is running (the wait above), so the
+    // audio side of the response ring is idle. A response left over from the old
+    // instance must not reach the next one — it can carry a pointer to it.
+    workResponses_.clear();
+
     if (instance_) {
         lilv_instance_deactivate(instance_);
     }
@@ -369,7 +381,7 @@ void LV2Plugin::process(const float* const* inputs, float* const* outputs, uint3
     for (auto& ap : atomPorts_) {
         auto* seq = reinterpret_cast<LV2_Atom_Sequence*>(
             atomPortBuffers_[ap.bufferIdx].data());
-        seq->atom.type = getGlobalUridMap().map(LV2_ATOM__Sequence);
+        seq->atom.type = atom_Sequence_;
         if (ap.isInput) {
             // Input: empty sequence (body header only)
             seq->atom.size = sizeof(LV2_Atom_Sequence_Body);
@@ -382,79 +394,61 @@ void LV2Plugin::process(const float* const* inputs, float* const* outputs, uint3
         seq->body.pad = 0;
     }
 
-    // Inject pending raw atom messages from UI (DPF state sync, etc.)
-    {
-        std::lock_guard<std::mutex> lock(pendingAtomMutex_);
-        if (!pendingAtoms_.empty()) {
-            for (auto& ap : atomPorts_) {
-                if (ap.isInput) {
-                    auto* buf = atomPortBuffers_[ap.bufferIdx].data();
-                    auto* seq = reinterpret_cast<LV2_Atom_Sequence*>(buf);
-                    // Append each pending atom as an event in the sequence
-                    for (auto& atomData : pendingAtoms_) {
-                        if (atomData.size() < sizeof(LV2_Atom)) continue;
-                        auto* srcAtom = reinterpret_cast<const LV2_Atom*>(atomData.data());
-                        uint32_t bodyDataSize = srcAtom->size;
-                        // Event: time(8) + atom header(8) + body data
-                        uint32_t evtBytes = sizeof(LV2_Atom_Event) + bodyDataSize;
-                        uint32_t paddedEvt = (evtBytes + 7u) & ~7u;
-                        // Check if there's room in the buffer
-                        uint32_t totalUsed = sizeof(LV2_Atom) + seq->atom.size;
-                        if (totalUsed + paddedEvt > kAtomBufferSize) continue;
-                        // Write at end of current sequence
-                        auto* writePos = reinterpret_cast<uint8_t*>(&seq->body) + seq->atom.size;
-                        auto* evt = reinterpret_cast<LV2_Atom_Event*>(writePos);
-                        evt->time.frames = 0;
-                        evt->body.size = bodyDataSize;
-                        evt->body.type = srcAtom->type;
-                        std::memcpy(reinterpret_cast<uint8_t*>(evt) + sizeof(LV2_Atom_Event),
-                                    atomData.data() + sizeof(LV2_Atom),
-                                    bodyDataSize);
-                        seq->atom.size += paddedEvt;
-                    }
-                    break;  // only inject into first atom input port
-                }
+    // Inject pending raw atom messages from UI (DPF state sync, etc.). The
+    // mailbox is lock-free, so this is the same work the old queue did minus
+    // the lock; each atom is appended as one event of the input sequence.
+    if (atomInputBufferIdx_ != kNoAtomBuffer) {
+        auto* seq = reinterpret_cast<LV2_Atom_Sequence*>(
+            atomPortBuffers_[atomInputBufferIdx_].data());
+        bool keepGoing = true;
+        while (keepGoing && pendingAtoms_.try_pop([this, seq, &keepGoing](size_t atomSize,
+                                                                        const uint8_t* atomData) {
+            switch (lv2rt::appendAtomToSequence(seq, static_cast<uint32_t>(kAtomBufferSize),
+                                                atomData, static_cast<uint32_t>(atomSize))) {
+                case lv2rt::AtomAppend::Appended:
+                    break;
+                case lv2rt::AtomAppend::NoRoom:
+                    // The atom left the mailbox, so this callback loses it: the
+                    // entries still queued are the ones that wait for the next
+                    // callback. Counted, never retried (see AtomAppend::NoRoom).
+                    discardedInputAtoms_.fetch_add(1, std::memory_order_relaxed);
+                    keepGoing = false;
+                    break;
+                case lv2rt::AtomAppend::Unrepresentable:
+                    // Never fits: dropping it keeps the mailbox from blocking
+                    // behind an atom that can never be delivered.
+                    discardedInputAtoms_.fetch_add(1, std::memory_order_relaxed);
+                    break;
             }
-            pendingAtoms_.clear();
+        })) {
         }
     }
 
-    // Forge pending patch:Set message into atom input port
-    {
-        std::lock_guard<std::mutex> lock(filePathMutex_);
-        if (!pendingFilePath_.empty()) {
-            for (auto& ap : atomPorts_) {
-                if (ap.isInput) {
-                    auto* buf = atomPortBuffers_[ap.bufferIdx].data();
-                    lv2_atom_forge_set_buffer(&forge_, buf, kAtomBufferSize);
+    // Forge pending patch:Set message into the atom input port. The mailbox
+    // already carries the resolved property URID and a fixed-size path, so no
+    // URI mapping (mutex) happens here. Draining both slots keeps the newest,
+    // which is the semantics a path change wants.
+    if (atomInputBufferIdx_ != kNoAtomBuffer) {
+        while (pendingFilePath_.try_pop([this](const lv2rt::FilePathMessage& message) {
+            auto* buf = atomPortBuffers_[atomInputBufferIdx_].data();
+            lv2_atom_forge_set_buffer(&forge_, buf, kAtomBufferSize);
 
-                    LV2_Atom_Forge_Frame seqFrame;
-                    lv2_atom_forge_sequence_head(&forge_, &seqFrame, 0);
+            LV2_Atom_Forge_Frame seqFrame;
+            lv2_atom_forge_sequence_head(&forge_, &seqFrame, 0);
 
-                    LV2_Atom_Forge_Frame objFrame;
-                    lv2_atom_forge_frame_time(&forge_, 0);
-                    lv2_atom_forge_object(&forge_, &objFrame, 0, patch_Set_);
+            LV2_Atom_Forge_Frame objFrame;
+            lv2_atom_forge_frame_time(&forge_, 0);
+            lv2_atom_forge_object(&forge_, &objFrame, 0, patch_Set_);
 
-                    lv2_atom_forge_key(&forge_, patch_property_);
-                    LV2_URID propUrid = getGlobalUridMap().map(
-                        pendingFilePropertyUri_.c_str());
-                    lv2_atom_forge_urid(&forge_, propUrid);
+            lv2_atom_forge_key(&forge_, patch_property_);
+            lv2_atom_forge_urid(&forge_, message.propertyUrid);
 
-                    lv2_atom_forge_key(&forge_, patch_value_);
-                    lv2_atom_forge_path(&forge_, pendingFilePath_.c_str(),
-                                        pendingFilePath_.size() + 1);
+            lv2_atom_forge_key(&forge_, patch_value_);
+            lv2_atom_forge_path(&forge_, message.path, message.length + 1);
 
-                    lv2_atom_forge_pop(&forge_, &objFrame);
-                    lv2_atom_forge_pop(&forge_, &seqFrame);
-
-                    LOGI("process: forged patch:Set for %s -> %s",
-                         pendingFilePropertyUri_.c_str(),
-                         pendingFilePath_.c_str());
-                    break;
-                }
-            }
-            pendingFilePath_.clear();
-            pendingFilePropertyUri_.clear();
+            lv2_atom_forge_pop(&forge_, &objFrame);
+            lv2_atom_forge_pop(&forge_, &seqFrame);
+        })) {
         }
     }
 
@@ -480,48 +474,45 @@ void LV2Plugin::process(const float* const* inputs, float* const* outputs, uint3
     // run() used stale forge state and violated the spec ordering.
     if (workerInterface_ && workerInterface_->work_response) {
         LV2_Handle handle = lilv_instance_get_handle(instance_);
-        std::lock_guard<std::mutex> lock(responseMutex_);
-        while (!workResponses_.empty()) {
-            auto& resp = workResponses_.front();
-            workerInterface_->work_response(
-                handle,
-                static_cast<uint32_t>(resp.size()),
-                resp.data());
-            workResponses_.pop();
+        // The ring hands over a pointer into its own slot, valid until the sink
+        // returns: no copy, no allocation on the audio thread.
+        while (workResponses_.try_pop([this, handle](size_t size, const uint8_t* data) {
+            workerInterface_->work_response(handle, static_cast<uint32_t>(size), data);
+        })) {
         }
     }
 
-    // Read atom output ports and queue events for UI forwarding
-    {
-        std::vector<OutputAtomEvent> batch;
-        for (auto& ap : atomPorts_) {
-            if (ap.isInput) continue;
-            auto* seq = reinterpret_cast<const LV2_Atom_Sequence*>(
-                atomPortBuffers_[ap.bufferIdx].data());
-            // Skip if empty or if the plugin left atom.size at the pre-run
-            // capacity (meaning it didn't write the output sequence at all —
-            // iterating would walk through uninitialised memory).
-            if (seq->atom.size <= sizeof(LV2_Atom_Sequence_Body) ||
-                seq->atom.size >= kAtomBufferSize) continue;
-            LV2_ATOM_SEQUENCE_FOREACH(seq, ev) {
-                uint32_t bodySize = ev->body.size;
-                // Sanity-check: event body must fit inside the atom buffer
-                const uint8_t* evEnd = reinterpret_cast<const uint8_t*>(&ev->body) +
-                                       sizeof(LV2_Atom) + bodySize;
-                const uint8_t* bufEnd = atomPortBuffers_[ap.bufferIdx].data() +
-                                        kAtomBufferSize;
-                if (evEnd > bufEnd) break;
-                uint32_t atomTotalSize = sizeof(LV2_Atom) + bodySize;
-                std::vector<uint8_t> data(atomTotalSize);
-                std::memcpy(data.data(), &ev->body, atomTotalSize);
-                batch.push_back(OutputAtomEvent{ap.portIndex, std::move(data)});
-            }
+    // Read atom output ports and queue events for UI forwarding. Each event is
+    // written straight into a mailbox slot: no std::vector per event, and the
+    // producer is the audio thread, so the ring never yields or allocates.
+    for (auto& ap : atomPorts_) {
+        if (ap.isInput) continue;
+        auto* seq = reinterpret_cast<const LV2_Atom_Sequence*>(
+            atomPortBuffers_[ap.bufferIdx].data());
+        // Skip if empty or if the plugin left atom.size at the pre-run
+        // capacity (meaning it didn't write the output sequence at all —
+        // iterating would walk through uninitialised memory).
+        if (seq->atom.size <= sizeof(LV2_Atom_Sequence_Body) ||
+            seq->atom.size >= kAtomBufferSize) {
+            continue;
         }
-        if (!batch.empty()) {
-            std::lock_guard<std::mutex> lock(outputAtomMutex_);
-            for (auto& evt : batch) {
-                pendingOutputAtoms_.push_back(std::move(evt));
+        LV2_ATOM_SEQUENCE_FOREACH(seq, ev) {
+            const uint32_t bodySize = ev->body.size;
+            // Sanity-check: event body must fit inside the atom buffer
+            const uint8_t* evEnd = reinterpret_cast<const uint8_t*>(&ev->body) +
+                                   sizeof(LV2_Atom) + bodySize;
+            const uint8_t* bufEnd = atomPortBuffers_[ap.bufferIdx].data() + kAtomBufferSize;
+            if (evEnd > bufEnd) break;
+            const uint32_t atomTotalSize = sizeof(LV2_Atom) + bodySize;
+            if (atomTotalSize > sizeof(lv2rt::OutputAtom::data)) {
+                oversizedOutputAtoms_.fetch_add(1, std::memory_order_relaxed);
+                continue;
             }
+            pendingOutputAtoms_.try_push_with([&ap, &ev, atomTotalSize](lv2rt::OutputAtom& atom) {
+                atom.portIndex = ap.portIndex;
+                atom.size = atomTotalSize;
+                std::memcpy(atom.data, &ev->body, atomTotalSize);
+            });
         }
     }
 
@@ -732,28 +723,92 @@ uint32_t LV2Plugin::getNumOutputPorts() const {
 }
 
 void LV2Plugin::setFilePath(const std::string& propertyUri, const std::string& path) {
-    std::lock_guard<std::mutex> lock(filePathMutex_);
-    pendingFilePropertyUri_ = propertyUri;
-    pendingFilePath_ = path;
-    LOGI("setFilePath: property=%s path=%s", propertyUri.c_str(), path.c_str());
+    // Resolve the URID here: mapping takes the global map's mutex, which the
+    // audio thread must never do, and the message then travels as a plain URID.
+    const LV2_URID propertyUrid = getGlobalUridMap().map(propertyUri.c_str());
+
+    // The mailbox is single-producer and this is reached from two threads
+    // (Dispatchers.Main through RackViewModel, Dispatchers.IO through the
+    // Tone3000 view models), so building the message and pushing it happen under
+    // one lock: without it two producers interleave inside the same slot and the
+    // reader sees a torn URID+path or loses an entry. Producer-side only; never
+    // locked from the audio thread, which only pops the ring.
+    lv2rt::FilePathRing::PushOutcome outcome;
+    {
+        std::lock_guard<std::mutex> lock(filePathProducerMutex_);
+        outcome = pendingFilePath_.try_push(propertyUrid, path.c_str(), path.size());
+    }
+
+    switch (outcome) {
+        case lv2rt::FilePathRing::PushOutcome::Pushed:
+            LOGI("setFilePath: property=%s path=%s", propertyUri.c_str(), path.c_str());
+            break;
+        case lv2rt::FilePathRing::PushOutcome::DroppedOldest:
+            LOGI("setFilePath: queued %s, the previous pending path was replaced",
+                 path.c_str());
+            break;
+        case lv2rt::FilePathRing::PushOutcome::DroppedNewest:
+            LOGE("setFilePath: the audio thread is still forging the pending patch:Set, "
+                 "%s dropped (property=%s)",
+                 path.c_str(), propertyUri.c_str());
+            break;
+        case lv2rt::FilePathRing::PushOutcome::TooLong:
+            LOGE("setFilePath: path of %zu bytes does not fit the %zu byte mailbox slot "
+                 "(property=%s), dropped",
+                 path.size(), lv2rt::FilePathMessage::kPathCapacity - 1, propertyUri.c_str());
+            break;
+    }
 }
 
 void LV2Plugin::injectAtom(const void* data, uint32_t size) {
     if (!data || size == 0) return;
-    std::vector<uint8_t> buf(size);
-    std::memcpy(buf.data(), data, size);
-    {
-        std::lock_guard<std::mutex> lock(pendingAtomMutex_);
-        pendingAtoms_.push_back(std::move(buf));
+    // No producer lock here, unlike setFilePath(): this is only called from the
+    // LV2 UI's write callback, which PluginUIManager dispatches on the single
+    // pluginUI thread of the display that owns the UI, and no JNI path reaches it.
+    switch (pendingAtoms_.try_push(data, size)) {
+        case lv2rt::AtomRing::PushOutcome::Pushed:
+            LOGI("injectAtom: queued %u bytes for atom input port", size);
+            break;
+        case lv2rt::AtomRing::PushOutcome::DroppedOldest:
+            LOGI("injectAtom: queued %u bytes, the oldest pending atom was replaced", size);
+            break;
+        case lv2rt::AtomRing::PushOutcome::DroppedNewest:
+            LOGE("injectAtom: the audio thread is reading the oldest atom, %u bytes dropped",
+                 size);
+            break;
+        case lv2rt::AtomRing::PushOutcome::TooLarge:
+            LOGE("injectAtom: %u bytes does not fit the %zu byte atom mailbox, dropped", size,
+                 lv2rt::kAtomBytes);
+            break;
     }
-    LOGI("injectAtom: queued %u bytes for atom input port", size);
 }
 
 std::vector<OutputAtomEvent> LV2Plugin::drainOutputAtoms() {
-    std::lock_guard<std::mutex> lock(outputAtomMutex_);
-    std::vector<OutputAtomEvent> result;
-    result.swap(pendingOutputAtoms_);
-    return result;
+    std::vector<OutputAtomEvent> events;
+    while (pendingOutputAtoms_.try_pop([&events](const lv2rt::OutputAtom& atom) {
+        events.push_back(OutputAtomEvent{atom.portIndex,
+                                         std::vector<uint8_t>(atom.data, atom.data + atom.size)});
+    })) {
+    }
+    return events;
+}
+
+uint64_t LV2Plugin::getAtomDropCount() const {
+    return pendingAtoms_.total_dropped() +
+           discardedInputAtoms_.load(std::memory_order_relaxed);
+}
+
+uint64_t LV2Plugin::getFilePathDropCount() const {
+    return pendingFilePath_.total_dropped();
+}
+
+uint64_t LV2Plugin::getWorkerResponseDropCount() const {
+    return workResponses_.total_dropped();
+}
+
+uint64_t LV2Plugin::getOutputAtomDropCount() const {
+    return pendingOutputAtoms_.total_dropped() +
+           oversizedOutputAtoms_.load(std::memory_order_relaxed);
 }
 
 void LV2Plugin::connectPorts() {
@@ -822,6 +877,7 @@ void LV2Plugin::initializePorts() {
     audioOutputPorts_.clear();
     atomPortBuffers_.clear();
     atomPorts_.clear();
+    atomInputBufferIdx_ = kNoAtomBuffer;
 
     uint32_t numPorts = lilv_plugin_get_num_ports(plugin_);
     LilvNode* audioClass = lilv_new_uri(world_, LILV_URI_AUDIO_PORT);
@@ -864,6 +920,11 @@ void LV2Plugin::initializePorts() {
             size_t bufIdx = atomPortBuffers_.size();
             atomPortBuffers_.emplace_back(kAtomBufferSize, 0);
             atomPorts_.push_back({i, isInput, bufIdx});
+            // UI atoms are injected into the first atom input port, resolved
+            // once here so the audio thread does not walk the port list.
+            if (isInput && atomInputBufferIdx_ == kNoAtomBuffer) {
+                atomInputBufferIdx_ = bufIdx;
+            }
         }
     }
 
@@ -1064,14 +1125,13 @@ void LV2Plugin::stopWorker() {
         workerThread_.join();
     }
 
-    // Clear queues
+    // Clear the request queue (the worker is joined, so nobody else pushes).
+    // The response ring is NOT cleared here: stopWorker() can run while the audio
+    // thread is still draining it, so its owner (deactivate()) clears it once
+    // processing_ is idle.
     {
         std::lock_guard<std::mutex> lock(workerMutex_);
         while (!workRequests_.empty()) workRequests_.pop();
-    }
-    {
-        std::lock_guard<std::mutex> lock(responseMutex_);
-        while (!workResponses_.empty()) workResponses_.pop();
     }
 
     workerInterface_ = nullptr;
@@ -1136,14 +1196,24 @@ LV2_Worker_Status LV2Plugin::respondCallback(
 {
     auto* self = static_cast<LV2Plugin*>(handle);
 
-    std::vector<uint8_t> buf(size);
-    if (size > 0 && data) {
-        std::memcpy(buf.data(), data, size);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(self->responseMutex_);
-        self->workResponses_.push(std::move(buf));
+    // Runs on the worker thread, which may log and allocate: the audio thread
+    // that drains this mailbox does neither. The response is copied straight
+    // into a slot, so the payload is delivered without a std::vector.
+    switch (self->workResponses_.try_push(data, size)) {
+        case lv2rt::ResponseRing::PushOutcome::Pushed:
+            break;
+        case lv2rt::ResponseRing::PushOutcome::DroppedOldest:
+            LOGE("work response: %u bytes queued, the oldest pending response was replaced",
+                 size);
+            break;
+        case lv2rt::ResponseRing::PushOutcome::DroppedNewest:
+            LOGE("work response: the audio thread is reading the oldest response, %u bytes "
+                 "dropped", size);
+            break;
+        case lv2rt::ResponseRing::PushOutcome::TooLarge:
+            LOGE("work response: %u bytes does not fit the %zu byte slot, dropped", size,
+                 lv2rt::kResponseBytes);
+            break;
     }
 
     return LV2_WORKER_SUCCESS;
@@ -1209,6 +1279,22 @@ uint32_t LV2Plugin::getNumOutputPorts() const {
 
 void LV2Plugin::setFilePath(const std::string& propertyUri, const std::string& path) {
     // Stub
+}
+
+uint64_t LV2Plugin::getAtomDropCount() const {
+    return 0;
+}
+
+uint64_t LV2Plugin::getFilePathDropCount() const {
+    return 0;
+}
+
+uint64_t LV2Plugin::getWorkerResponseDropCount() const {
+    return 0;
+}
+
+uint64_t LV2Plugin::getOutputAtomDropCount() const {
+    return 0;
 }
 
 void LV2Plugin::connectPorts() {

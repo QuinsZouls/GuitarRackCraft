@@ -64,8 +64,16 @@ private:
     std::ofstream processedFile_;
     std::thread writerThread_;
 
-    // Temp buffer for interleaving stereo in feedAudio (avoid allocation)
+    // Preallocated interleave buffer for feedAudio(). Sized in
+    // startRecording() so the audio thread never allocates. recording_ is the
+    // hand-off: startRecording() resizes this buffer and then publishes it with
+    // a release store, and feedAudio() acquires recording_ before writing, so a
+    // callback that sees recording_ = true also sees the sized buffer.
     std::vector<float> interleaveBuffer_;
+
+    /** Largest block feedAudio() will interleave (frames); 8192 frames is well
+     *  above any HAL burst and keeps the scratch at 64 KB. */
+    static constexpr int32_t kMaxFeedFrames = 8192;
 
     void writerLoop();
     void writeWavHeader(std::ofstream& file, uint16_t numChannels, uint32_t sampleRate);

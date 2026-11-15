@@ -374,7 +374,7 @@ fun RackScreen(
             topBar = {
             if (isFullscreenActive) return@Scaffold
             val statusText = if (isEngineRunning) {
-                var s = "Running · %.1f ms · CPU %.0f%%".format(latencyMs, cpuLoad * 100f)
+                var s = "Running · %.1f ms RT · CPU %.0f%%".format(latencyMs, cpuLoad * 100f)
                 if (xRunCount > 0) s += " · XRuns $xRunCount"
                 if (inputClipping || outputClipping) s += " · Clip!"
                 s

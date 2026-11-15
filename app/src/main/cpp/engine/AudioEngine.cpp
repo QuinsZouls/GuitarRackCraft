@@ -18,9 +18,11 @@
  */
 
 #include "AudioEngine.h"
+#include "AudioFormatUtils.h"
 #include "utils/WavIO.h"
 #include "utils/ThreadUtils.h"
 #include <oboe/OboeExtensions.h>
+#include <android/api-level.h>
 #include <android/log.h>
 #include <atomic>
 #include <chrono>
@@ -37,6 +39,201 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace guitarrackcraft {
+
+namespace {
+
+/** u/voice-performance only exists from Android 10 on. */
+constexpr int32_t kVoicePerformanceMinApiLevel = 29;
+/** How long the monitor thread of out-of-process plugins waits between samples. */
+constexpr int kPluginMonitorIntervalMs = 500;
+/** LatencyTuner wants a whole number of bursts; two is the documented minimum. */
+constexpr int32_t kMinimumBursts = 2;
+
+/**
+ * One rung of the stream negotiation ladder. The engine asks for the cheapest
+ * configuration first (mono float, the one that MMAPs on every device we have
+ * seen) and degrades the request until the HAL grants Exclusive + MMAP.
+ */
+struct StreamAttempt {
+    oboe::AudioFormat format;
+    int32_t channels;
+    oboe::InputPreset preset;  // input only
+    const char* label;
+};
+
+bool isPowerOfTwo(int32_t value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+uint32_t nextPowerOfTwo(uint32_t value) {
+    uint32_t power = 1;
+    while (power < value) {
+        power <<= 1;
+    }
+    return power;
+}
+
+const char* sharingModeText(oboe::SharingMode mode) {
+    return mode == oboe::SharingMode::Exclusive ? "Exclusive" : "Shared";
+}
+
+/**
+ * The whole point of the ladder: on a shared (legacy) stream the HAL adds one
+ * extra buffer stage and the round trip roughly doubles, so a configuration is
+ * only considered good when both Exclusive and MMAP were granted.
+ */
+bool grantsExclusiveMmap(oboe::AudioStream* stream) {
+    return stream != nullptr &&
+           stream->getSharingMode() == oboe::SharingMode::Exclusive &&
+           oboe::OboeExtensions::isMMapUsed(stream);
+}
+
+oboe::AudioStreamBuilder makeInputBuilder(const StreamAttempt& attempt, oboe::AudioApi api,
+                                          int32_t sampleRate, int32_t deviceId) {
+    oboe::AudioStreamBuilder builder;
+    builder.setDirection(oboe::Direction::Input)
+           ->setAudioApi(api)
+           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+           ->setSharingMode(oboe::SharingMode::Exclusive)
+           ->setFormat(attempt.format)
+           ->setChannelCount(attempt.channels)
+           ->setSampleRate(sampleRate)
+           ->setInputPreset(attempt.preset);
+    if (deviceId != 0) {
+        builder.setDeviceId(deviceId);
+    }
+    return builder;
+}
+
+oboe::AudioStreamBuilder makeOutputBuilder(const StreamAttempt& attempt, oboe::AudioApi api,
+                                           int32_t sampleRate, int32_t deviceId,
+                                           int32_t framesPerDataCallback,
+                                           oboe::AudioStreamCallback* callback) {
+    oboe::AudioStreamBuilder builder;
+    builder.setDirection(oboe::Direction::Output)
+           ->setAudioApi(api)
+           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+           ->setSharingMode(oboe::SharingMode::Exclusive)
+           ->setFormat(attempt.format)
+           ->setChannelCount(attempt.channels)
+           ->setSampleRate(sampleRate)
+           ->setUsage(oboe::Usage::Game)
+           ->setCallback(callback);
+    if (deviceId != 0) {
+        builder.setDeviceId(deviceId);
+    }
+    if (framesPerDataCallback > 0) {
+        builder.setFramesPerDataCallback(framesPerDataCallback);
+    }
+    return builder;
+}
+
+int32_t classifyInputPreset(oboe::InputPreset preset) {
+    switch (preset) {
+        case oboe::InputPreset::VoiceRecognition:
+            return 0;
+        case oboe::InputPreset::VoicePerformance:
+            return 1;
+        default:
+            return 2;
+    }
+}
+
+int64_t monotonicNowNs() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + static_cast<int64_t>(ts.tv_nsec);
+}
+
+/**
+ * Walks the ladder and returns the first stream that grants Exclusive + MMAP.
+ * When none does, the last configuration that opened at all is returned so the
+ * engine still starts (legacy path) instead of leaving the user without audio.
+ * `makeBuilder` builds one fully configured builder per rung.
+ */
+template <typename MakeBuilder>
+oboe::AudioStream* negotiateStream(const std::vector<StreamAttempt>& ladder, const char* direction,
+                                   const MakeBuilder& makeBuilder, StreamAttempt& grantedAttempt) {
+    oboe::AudioStream* accepted = nullptr;
+    oboe::AudioStream* openedFallback = nullptr;
+    for (const auto& attempt : ladder) {
+        oboe::AudioStreamBuilder builder = makeBuilder(attempt);
+        oboe::AudioStream* stream = nullptr;
+        const oboe::Result openResult = builder.openStream(&stream);
+        if (openResult != oboe::Result::OK || stream == nullptr) {
+            LOGI("%s [%s] open failed: %s", direction, attempt.label,
+                 oboe::convertToText(openResult));
+            continue;
+        }
+        const bool lowLatency = grantsExclusiveMmap(stream);
+        LOGI("%s [%s] granted api=%d sharing=%s mmap=%d format=%d channels=%d preset=%d burst=%d rate=%d -> %s",
+             direction, attempt.label, static_cast<int>(stream->getAudioApi()),
+             sharingModeText(stream->getSharingMode()),
+             oboe::OboeExtensions::isMMapUsed(stream) ? 1 : 0,
+             static_cast<int>(stream->getFormat()), stream->getChannelCount(),
+             static_cast<int>(stream->getInputPreset()), stream->getFramesPerBurst(),
+             stream->getSampleRate(), lowLatency ? "ACCEPTED" : "kept as legacy fallback");
+        if (lowLatency) {
+            if (openedFallback != nullptr) {
+                openedFallback->close();
+                delete openedFallback;
+                openedFallback = nullptr;
+            }
+            accepted = stream;
+            grantedAttempt = attempt;
+            break;
+        }
+        if (openedFallback != nullptr) {
+            openedFallback->close();
+            delete openedFallback;
+        }
+        openedFallback = stream;
+        grantedAttempt = attempt;
+    }
+    return accepted != nullptr ? accepted : openedFallback;
+}
+
+/**
+ * Reopens the output stream with an explicit frames-per-callback. Needed when
+ * the hardware burst is not a power of two (convolvers partition on power of
+ * two blocks). On failure the original configuration is retried so a quirk of
+ * one device cannot leave the engine without output.
+ */
+bool reopenOutputStream(oboe::AudioStream** streamSlot, const StreamAttempt& attempt,
+                        oboe::AudioApi api, int32_t sampleRate, int32_t deviceId,
+                        int32_t framesPerDataCallback, oboe::AudioStreamCallback* callback,
+                        uint32_t& callbackFrameCount) {
+    LOGI("output: reopening [%s] with framesPerDataCallback=%d", attempt.label, framesPerDataCallback);
+    if (*streamSlot != nullptr) {
+        (*streamSlot)->close();
+        delete *streamSlot;
+        *streamSlot = nullptr;
+    }
+    for (int32_t requested : {framesPerDataCallback, 0}) {
+        oboe::AudioStreamBuilder builder = makeOutputBuilder(attempt, api, sampleRate, deviceId,
+                                                             requested, callback);
+        oboe::AudioStream* stream = nullptr;
+        const oboe::Result result = builder.openStream(&stream);
+        if (result == oboe::Result::OK && stream != nullptr) {
+            *streamSlot = stream;
+            if (requested == 0) {
+                // The HAL refused the pinned block size: follow the hardware burst
+                // instead. Convolvers were activated for the old size, so this is
+                // logged as a warning rather than silently accepted.
+                callbackFrameCount = nextPowerOfTwo(
+                    static_cast<uint32_t>(std::max(1, stream->getFramesPerBurst())));
+                LOGE("output: framesPerDataCallback=%d rejected, following the burst (%u frames)",
+                     framesPerDataCallback, callbackFrameCount);
+            }
+            return true;
+        }
+        LOGE("output: reopen with framesPerDataCallback=%d failed: %s", requested,
+             oboe::convertToText(result));
+    }
+    return false;
+}
+
+} // namespace
 
 AudioEngine::AudioEngine()
     : sampleRate_(48000.0f)
@@ -70,6 +267,7 @@ bool AudioEngine::start(float sampleRate, int32_t inputDeviceId,
         LOGE("Failed to create audio streams");
         return false;
     }
+    startVstMonitor();
 
     // Activate plugin chain with the power-of-2 callback frame count
     // so convolver plugins configure their partition size correctly
@@ -98,6 +296,10 @@ void AudioEngine::stop() {
         closeStreams();
         return;
     }
+    // Stop the /proc monitor first: it walks the plugin chain and must not
+    // outlive the streams or the chain it reads.
+    stopVstMonitor();
+
     // Stop recording before tearing down the audio path
     if (recorder_.isRecording()) {
         recorder_.stopRecording();
@@ -119,7 +321,7 @@ bool AudioEngine::isRunning() const {
     return isRunning_;
 }
 
-AudioEngine::StreamInfo AudioEngine::getStreamInfo() const {
+AudioEngine::StreamInfo AudioEngine::getStreamInfo() {
     StreamInfo info;
     if (outputStream_) {
         info.isAAudio = outputStream_->getAudioApi() == oboe::AudioApi::AAudio;
@@ -128,25 +330,71 @@ AudioEngine::StreamInfo AudioEngine::getStreamInfo() const {
         info.outputMMap = oboe::OboeExtensions::isMMapUsed(outputStream_.get());
         info.outputCallback = true; // always using callback
         info.framesPerBurst = outputStream_->getFramesPerBurst();
+        info.outputChannels = outputStream_->getChannelCount();
+        info.outputFormat = outputFormatIsFloat_ ? 0 : 1;
+        info.outputBufferSizeInFrames = outputStream_->getBufferSizeInFrames();
+        info.outputBufferCapacity = outputStream_->getBufferCapacityInFrames();
+        // The value the stream itself reports, which is 0 when the HAL burst
+        // drives the callback size. callbackFrameCount_ is only the request the
+        // chain was activated with, so it must not be reported as granted.
+        info.outputFramesPerCallback = outputStream_->getFramesPerCallback();
+        info.outputTimestampSupported =
+            outputStream_->getTimestamp(CLOCK_MONOTONIC) == oboe::Result::OK ? 1 : 0;
     }
     if (inputStream_) {
         info.inputExclusive = inputStream_->getSharingMode() == oboe::SharingMode::Exclusive;
         info.inputLowLatency = inputStream_->getPerformanceMode() == oboe::PerformanceMode::LowLatency;
+        info.inputMMap = oboe::OboeExtensions::isMMapUsed(inputStream_.get());
+        info.inputChannels = inputStream_->getChannelCount();
+        info.inputFormat = inputFormatIsFloat_ ? 0 : 1;
+        info.inputPreset = static_cast<int32_t>(inputPreset_);
+        info.inputFramesPerBurst = inputStream_->getFramesPerBurst();
+        info.inputBufferSizeInFrames = inputStream_->getBufferSizeInFrames();
     }
     return info;
 }
 
-double AudioEngine::getLatencyMs() const {
-    if (!outputStream_) {
-        return 0.0;
+double AudioEngine::getLatencyMs() {
+    return getLatencyDetails().roundTripMs;
+}
+
+AudioEngine::LatencyDetails AudioEngine::getLatencyDetails() {
+    LatencyDetails details;
+    const double rate = sampleRate_ > 0.0f ? static_cast<double>(sampleRate_) : 48000.0;
+    const int64_t nowNs = monotonicNowNs();
+
+    if (inputStream_) {
+        const int64_t framesRead = inputStream_->getFramesRead();
+        int64_t latencyFrames = 0;
+        auto timestamp = inputStream_->getTimestamp(CLOCK_MONOTONIC);
+        if (timestamp == oboe::Result::OK) {
+            latencyFrames = latency::inputLatencyFrames(timestamp.value().position,
+                                                       timestamp.value().timestamp, nowNs, rate,
+                                                       framesRead);
+            inputLatencyHold_.store(latencyFrames, nowNs);
+        } else if (!inputLatencyHold_.get(nowNs, latencyFrames)) {
+            latencyFrames = latency::fillLatencyFrames(inputStream_->getFramesWritten(), framesRead);
+        }
+        details.inputMs = latency::framesToMs(latencyFrames, rate);
     }
-    
-    int64_t framesWritten = outputStream_->getFramesWritten();
-    int64_t framesRead = outputStream_->getFramesRead();
-    int32_t bufferSize = outputStream_->getBufferSizeInFrames();
-    
-    double latencyFrames = bufferSize + (framesWritten - framesRead);
-    return (latencyFrames / sampleRate_) * 1000.0;
+
+    if (outputStream_) {
+        const int64_t framesWritten = outputStream_->getFramesWritten();
+        int64_t latencyFrames = 0;
+        auto timestamp = outputStream_->getTimestamp(CLOCK_MONOTONIC);
+        if (timestamp == oboe::Result::OK) {
+            latencyFrames = latency::outputLatencyFrames(timestamp.value().position,
+                                                        timestamp.value().timestamp, nowNs, rate,
+                                                        framesWritten);
+            outputLatencyHold_.store(latencyFrames, nowNs);
+        } else if (!outputLatencyHold_.get(nowNs, latencyFrames)) {
+            latencyFrames = latency::fillLatencyFrames(framesWritten, outputStream_->getFramesRead());
+        }
+        details.outputMs = latency::framesToMs(latencyFrames, rate);
+    }
+
+    details.roundTripMs = details.inputMs + details.outputMs;
+    return details;
 }
 
 float AudioEngine::getInputLevel() const {
@@ -316,7 +564,11 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
             LOGI("onAudioReady ENTER tid=%ld (callback thread, count=%d)", getTid(), c);
         }
     }
-    // Debug: log when callback bails due to shutdown (rate-limited)
+    // Debug: log when callback bails due to shutdown (rate-limited).
+    // Deliberate exception to "every exit path ends in finishOutputCallback()":
+    // tune() may call setBufferSizeInFrames(), and during teardown the stream is
+    // being stopped/closed underneath us, so an extra buffer resize would either
+    // fail loudly or touch a stream that is already gone.
     if (!isRunning_ || numFrames <= 0) {
         static std::atomic<int> bailCount{0};
         int c = bailCount++;
@@ -326,9 +578,29 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         }
         return oboe::DataCallbackResult::Continue;
     }
-    // Only process when the output stream needs data (we do not set callback on input).
+    // Only process when the output stream needs data (we do not set callback on
+    // input). Like the bail above, this return skips tune() on purpose: it is a
+    // callback for a different stream (the input one), and tuning the output
+    // buffer from an input callback would size it against the wrong deadline.
     if (audioStream != outputStream_.get()) {
         return oboe::DataCallbackResult::Continue;
+    }
+
+    // A callback larger than the preallocated buffers would need a resize, which
+    // is forbidden on the audio thread. It cannot happen for a sane configuration
+    // (frames per callback <= stream capacity), so play silence and keep running.
+    if (static_cast<size_t>(numFrames) > bufferCapacityFrames_) {
+        static auto lastCapacityLog = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - lastCapacityLog).count() >= 1.0) {
+            lastCapacityLog = now;
+            LOGE("onAudioReady: numFrames=%d exceeds the preallocated %zu frames, muting",
+                 numFrames, bufferCapacityFrames_);
+        }
+        const size_t sampleBytes = outputFormatIsFloat_ ? sizeof(float) : sizeof(int16_t);
+        const int32_t channels = std::max(1, audioStream->getChannelCount());
+        std::memset(audioData, 0, static_cast<size_t>(numFrames) * channels * sampleBytes);
+        return finishOutputCallback();
     }
 
     // Input source: WAV playback or microphone
@@ -346,16 +618,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
             wavPlaying_.store(false);
         }
     } else {
-        int32_t framesRead = 0;
-        if (inputStream_) {
-            auto result = inputStream_->read(inputBuffer_.data(), numFrames, 0);
-            if (result == oboe::Result::OK) {
-                framesRead = result.value();
-            }
-        }
-        if (framesRead < numFrames) {
-            std::memset(inputBuffer_.data() + framesRead, 0, (numFrames - framesRead) * sizeof(float));
-        }
+        readInputIntoBuffer(numFrames);
     }
 
     // Global input gain (post-gain gain staging: meters, recorder raw tap and
@@ -385,22 +648,12 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         }
     }
 
-    // Ensure buffers are large enough
-    if (inputBuffer_.size() < static_cast<size_t>(numFrames)) {
-        inputBuffer_.resize(numFrames);
-    }
-    if (outputBufferLeft_.size() < static_cast<size_t>(numFrames)) {
-        outputBufferLeft_.resize(numFrames);
-        outputBufferRight_.resize(numFrames);
-    }
-
     // Set up input pointers (mono guitar input -> stereo)
     inputPtrs_[0] = inputBuffer_.data();
     inputPtrs_[1] = inputBuffer_.data();  // Duplicate mono to stereo
 
     // Set up output pointers (always process into our buffers for metering)
-    float* outputData = static_cast<float*>(audioData);
-    int32_t numChannels = audioStream->getChannelCount();
+    const int32_t numChannels = audioStream->getChannelCount();
     outputPtrs_[0] = outputBufferLeft_.data();
     outputPtrs_[1] = outputBufferRight_.data();
 
@@ -420,74 +673,9 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         float load = static_cast<float>(processMs / bufferDurationMs);
         if (load > 1.0f) load = 1.0f;
 
-        /* Sample subprocess (wine VST) CPU + xruns every ~1s of audio
-         * callbacks. The plain cpuLoad_ measurement above misses VST work
-         * entirely because the wine subprocess runs in a different
-         * address space — getCpuLoad() returns ~1% with a CPU-pinned
-         * Helix Native loaded. Sampling rate is human-display rate, not
-         * audio rate, so once per second is plenty. */
-        constexpr uint32_t kSampleEveryNCallbacks = 100;
-        if (++vstSampleCounter_ >= kSampleEveryNCallbacks) {
-            vstSampleCounter_ = 0;
-            struct timespec ts{};
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t nowNs = (uint64_t)ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
-            uint64_t totalDeltaJiffies = 0;
-            int32_t totalUnderruns = 0;
-            const size_t n = chain_.getSize();
-            for (size_t i = 0; i < n; ++i) {
-                guitarrackcraft::IPlugin* p = chain_.getPlugin((int)i);
-                if (!p) continue;
-                totalUnderruns += p->getUnderrunCount();
-                int pid = p->getSubprocessPid();
-                if (pid <= 0) continue;
-                /* /proc/<pid>/stat fields utime (14) + stime (15) are
-                 * cumulative jiffies (typically 100Hz on Android) since
-                 * subprocess start. Read both, sum, diff against last
-                 * sample to derive jiffies-per-wall-second. */
-                char path[64];
-                std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-                FILE* f = std::fopen(path, "r");
-                if (!f) continue;
-                char buf[512];
-                size_t got = std::fread(buf, 1, sizeof(buf) - 1, f);
-                std::fclose(f);
-                if (got == 0) continue;
-                buf[got] = 0;
-                /* Skip past "comm" (in parens — name can contain spaces),
-                 * then we're at field 3 (state). utime is field 14,
-                 * stime is field 15. */
-                char* p2 = std::strrchr(buf, ')');
-                if (!p2) continue;
-                unsigned long long fields[16] = {0};
-                int read = std::sscanf(p2 + 1,
-                    " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
-                    &fields[13], &fields[14]);
-                if (read != 2) continue;
-                uint64_t cur = fields[13] + fields[14];
-                auto it = vstLastJiffies_.find(pid);
-                if (it != vstLastJiffies_.end()) {
-                    totalDeltaJiffies += cur - it->second;
-                    it->second = cur;
-                } else {
-                    vstLastJiffies_[pid] = cur;
-                }
-            }
-            if (vstLastSampleNs_ > 0 && nowNs > vstLastSampleNs_) {
-                uint64_t elapsedNs = nowNs - vstLastSampleNs_;
-                /* sysconf(_SC_CLK_TCK) is the jiffies-per-second on this
-                 * system; on Android it's 100. Compute fraction of one
-                 * CPU's wall time the subprocesses used in aggregate. */
-                long clk = sysconf(_SC_CLK_TCK);
-                if (clk <= 0) clk = 100;
-                double secs = (double)elapsedNs / 1.0e9;
-                double frac = ((double)totalDeltaJiffies / (double)clk) / secs;
-                if (frac > 1.0) frac = 1.0;
-                vstCpuLoad_.store((float)frac);
-            }
-            vstLastSampleNs_ = nowNs;
-            vstUnderruns_.store(totalUnderruns);
-        }
+        /* The out-of-process (wine VST) load is sampled by vstMonitorLoop();
+         * reading /proc from this thread would mean fopen/fread on the audio
+         * thread. Here only the in-process measurement is published. */
         cpuLoad_.store(load);
     }
 
@@ -526,19 +714,8 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         }
     }
 
-    // Copy to output (stereo: deinterleave; mono: mix)
-    if (numChannels == 2) {
-        for (int32_t i = 0; i < numFrames; ++i) {
-            outputData[i * 2] = outputBufferLeft_[i];
-            outputData[i * 2 + 1] = outputBufferRight_[i];
-        }
-    } else {
-        for (int32_t i = 0; i < numFrames; ++i) {
-            outputData[i] = (outputBufferLeft_[i] + outputBufferRight_[i]) * 0.5f;
-        }
-    }
-
-    return oboe::DataCallbackResult::Continue;
+    writeOutputBuffer(audioData, numFrames, numChannels);
+    return finishOutputCallback();
 }
 
 void AudioEngine::onErrorBeforeClose(oboe::AudioStream* oboeStream, oboe::Result error) {
@@ -567,166 +744,492 @@ bool AudioEngine::createAudioStreams(float sampleRate) {
     LOGI("MMAP supported=%d enabled=%d", oboe::OboeExtensions::isMMapSupported(),
          oboe::OboeExtensions::isMMapEnabled());
 
-    // --- Input stream (mono, for guitar) ---
-    // Force AAudio API — OpenSL ES cannot do exclusive or MMAP.
-    // Oboe's QuirksManager may silently choose OpenSL ES otherwise.
-    // Use a dedicated builder to avoid leaking input-only settings to output.
-    // Do NOT set a callback on input — only the output stream drives the callback.
-    // We read from the input inside the output stream's onAudioReady.
-    oboe::AudioStreamBuilder inputBuilder;
-    inputBuilder.setDirection(oboe::Direction::Input)
-           ->setAudioApi(oboe::AudioApi::AAudio)
-           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-           ->setSharingMode(oboe::SharingMode::Exclusive)
-           ->setFormat(oboe::AudioFormat::Float)
-           ->setChannelCount(1)
-           ->setSampleRate(static_cast<int32_t>(sampleRate))
-           ->setInputPreset(oboe::InputPreset::VoiceRecognition);
+    sampleRate_ = sampleRate;
 
-    if (inputDeviceId_ != 0) {
-        inputBuilder.setDeviceId(inputDeviceId_);
-        LOGI("Input device ID set to %d", inputDeviceId_);
+    if (!openInputStream()) {
+        LOGE("Failed to open the input stream");
+        return false;
+    }
+    if (!openOutputStream()) {
+        LOGE("Failed to open the output stream");
+        closeStreams();
+        return false;
+    }
+    if (!startStreams()) {
+        closeStreams();
+        return false;
     }
 
-    oboe::AudioStream* inputStreamPtr = nullptr;
-    oboe::Result result = inputBuilder.openStream(&inputStreamPtr);
-    if (result != oboe::Result::OK) {
-        // AAudio failed — retry without forcing API (let Oboe pick)
-        LOGE("AAudio input open failed (%s), retrying with default API", oboe::convertToText(result));
-        inputBuilder.setAudioApi(oboe::AudioApi::Unspecified);
-        result = inputBuilder.openStream(&inputStreamPtr);
-        if (result != oboe::Result::OK) {
-            LOGE("Failed to open input stream: %s", oboe::convertToText(result));
-            return false;
+    prepareBuffers();
+
+    LOGI("Audio streams created: %d Hz, request callback %u frames, output buffer %d/%d frames",
+         static_cast<int>(sampleRate_), callbackFrameCount_,
+         outputStream_->getBufferSizeInFrames(), outputStream_->getBufferCapacityInFrames());
+    return true;
+}
+
+bool AudioEngine::openInputStream() {
+    const int32_t apiLevel = android_get_device_api_level();
+    std::vector<StreamAttempt> ladder = {
+        {oboe::AudioFormat::Float, 1, oboe::InputPreset::VoiceRecognition,
+         "mono/float/voice-recognition"},
+        {oboe::AudioFormat::Float, 2, oboe::InputPreset::VoiceRecognition,
+         "stereo/float/voice-recognition"},
+        {oboe::AudioFormat::I16, 1, oboe::InputPreset::VoiceRecognition,
+         "mono/i16/voice-recognition"},
+        {oboe::AudioFormat::I16, 2, oboe::InputPreset::VoiceRecognition,
+         "stereo/i16/voice-recognition"},
+    };
+    if (apiLevel >= kVoicePerformanceMinApiLevel) {
+        ladder.insert(ladder.begin() + 2,
+                      {oboe::AudioFormat::Float, 2, oboe::InputPreset::VoicePerformance,
+                       "stereo/float/voice-performance"});
+    } else {
+        LOGI("input: skipping the voice-performance rung (API level %d < %d)", apiLevel,
+             kVoicePerformanceMinApiLevel);
+    }
+    LOGI("input: negotiating over %zu configurations (AAudio first)", ladder.size());
+
+    for (oboe::AudioApi api : {oboe::AudioApi::AAudio, oboe::AudioApi::Unspecified}) {
+        StreamAttempt granted = ladder.front();
+        const int32_t rate = static_cast<int32_t>(sampleRate_);
+        oboe::AudioStream* stream = negotiateStream(
+            ladder, "input",
+            [&](const StreamAttempt& attempt) {
+                return makeInputBuilder(attempt, api, rate, inputDeviceId_);
+            },
+            granted);
+        if (stream == nullptr) {
+            // AAudio cannot open anything at all: fall back to whatever Oboe picks.
+            LOGI("input: no configuration could be opened with audioApi=%d", static_cast<int>(api));
+            continue;
         }
-    }
-    inputStream_.reset(inputStreamPtr);
 
-    LOGI("Input stream opened: api=%d sharing=%d perf=%d mmap=%d",
-         static_cast<int>(inputStream_->getAudioApi()),
-         static_cast<int>(inputStream_->getSharingMode()),
-         static_cast<int>(inputStream_->getPerformanceMode()),
-         oboe::OboeExtensions::isMMapUsed(inputStream_.get()));
-
-    // Use actual sample rate from stream
-    sampleRate_ = static_cast<float>(inputStream_->getSampleRate());
-
-    // --- Output stream (stereo) ---
-    oboe::AudioStreamBuilder outputBuilder;
-    outputBuilder.setDirection(oboe::Direction::Output)
-           ->setAudioApi(oboe::AudioApi::AAudio)
-           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-           ->setSharingMode(oboe::SharingMode::Exclusive)
-           ->setFormat(oboe::AudioFormat::Float)
-           ->setChannelCount(2)
-           ->setSampleRate(static_cast<int32_t>(sampleRate_))
-           ->setUsage(oboe::Usage::Game)
-           ->setCallback(this);
-
-    if (outputDeviceId_ != 0) {
-        outputBuilder.setDeviceId(outputDeviceId_);
-        LOGI("Output device ID set to %d", outputDeviceId_);
-    }
-
-    oboe::AudioStream* outputStreamPtr = nullptr;
-    result = outputBuilder.openStream(&outputStreamPtr);
-    if (result != oboe::Result::OK) {
-        // AAudio failed — retry without forcing API
-        LOGE("AAudio output open failed (%s), retrying with default API", oboe::convertToText(result));
-        outputBuilder.setAudioApi(oboe::AudioApi::Unspecified);
-        result = outputBuilder.openStream(&outputStreamPtr);
-        if (result != oboe::Result::OK) {
-            LOGE("Failed to open output stream: %s", oboe::convertToText(result));
-            closeStreams();
-            return false;
+        inputStream_.reset(stream);
+        sampleRate_ = static_cast<float>(inputStream_->getSampleRate());
+        inputChannels_ = std::max(1, inputStream_->getChannelCount());
+        inputFormatIsFloat_ = inputStream_->getFormat() == oboe::AudioFormat::Float;
+        if (inputStream_->getFormat() != oboe::AudioFormat::Float &&
+            inputStream_->getFormat() != oboe::AudioFormat::I16) {
+            LOGE("input: unexpected granted format %d, treating it as 16-bit PCM",
+                 static_cast<int>(inputStream_->getFormat()));
         }
+        inputPreset_ = static_cast<InputPresetClass>(classifyInputPreset(inputStream_->getInputPreset()));
+
+        LOGI("Input stream opened: label=[%s] api=%d sharing=%d perf=%d mmap=%d format=%d channels=%d preset=%d rate=%d burst=%d exclusive+mmap=%d",
+             granted.label, static_cast<int>(inputStream_->getAudioApi()),
+             static_cast<int>(inputStream_->getSharingMode()),
+             static_cast<int>(inputStream_->getPerformanceMode()),
+             oboe::OboeExtensions::isMMapUsed(inputStream_.get()) ? 1 : 0,
+             static_cast<int>(inputStream_->getFormat()), inputChannels_,
+             static_cast<int>(inputStream_->getInputPreset()), inputStream_->getSampleRate(),
+             inputStream_->getFramesPerBurst(),
+             grantsExclusiveMmap(inputStream_.get()) ? 1 : 0);
+        if (!grantsExclusiveMmap(inputStream_.get())) {
+            LOGI("input: no configuration was granted Exclusive+MMAP, running on the legacy "
+                 "shared path (higher round-trip latency)");
+        }
+        return true;
     }
+    return false;
+}
 
-    LOGI("Output stream opened: api=%d sharing=%d perf=%d mmap=%d",
-         static_cast<int>(outputStreamPtr->getAudioApi()),
-         static_cast<int>(outputStreamPtr->getSharingMode()),
-         static_cast<int>(outputStreamPtr->getPerformanceMode()),
-         oboe::OboeExtensions::isMMapUsed(outputStreamPtr));
+bool AudioEngine::openOutputStream() {
+    std::vector<StreamAttempt> ladder = {
+        {oboe::AudioFormat::Float, 2, oboe::InputPreset::Unprocessed, "stereo/float"},
+        {oboe::AudioFormat::I16, 2, oboe::InputPreset::Unprocessed, "stereo/i16"},
+    };
 
-    // Determine callback block size.
-    // If the user requested a specific buffer size, use it directly.
-    // Otherwise, ensure power-of-2 for convolver plugin compatibility.
-    {
+    // When the user pinned a buffer size we know the callback block up front, so
+    // every rung can carry it and no second open is needed.
+    const int32_t wantedFramesPerCallback = requestedBufferFrames_ > 0 ? requestedBufferFrames_ : 0;
+    LOGI("output: negotiating over %zu configurations, framesPerDataCallback=%d", ladder.size(),
+         wantedFramesPerCallback);
+
+    for (oboe::AudioApi api : {oboe::AudioApi::AAudio, oboe::AudioApi::Unspecified}) {
+        StreamAttempt granted = ladder.front();
+        const int32_t rate = static_cast<int32_t>(sampleRate_);
+        oboe::AudioStream* stream = negotiateStream(
+            ladder, "output",
+            [&](const StreamAttempt& attempt) {
+                return makeOutputBuilder(attempt, api, rate, outputDeviceId_,
+                                         wantedFramesPerCallback, this);
+            },
+            granted);
+        if (stream == nullptr) {
+            LOGI("output: no configuration could be opened with audioApi=%d", static_cast<int>(api));
+            continue;
+        }
+        // The callback block size is only pinned on the builder here: the stream
+        // is not owned yet so the power-of-two reopen can swap it safely.
         if (requestedBufferFrames_ > 0) {
             callbackFrameCount_ = static_cast<uint32_t>(requestedBufferFrames_);
-            LOGI("Using user-requested buffer frames: %u", callbackFrameCount_);
-            outputStreamPtr->close();
-            delete outputStreamPtr;
-            outputStreamPtr = nullptr;
-
-            outputBuilder.setFramesPerCallback(requestedBufferFrames_);
-            result = outputBuilder.openStream(&outputStreamPtr);
-            if (result != oboe::Result::OK) {
-                LOGE("Failed to reopen output stream with requested buffer: %s",
-                     oboe::convertToText(result));
-                closeStreams();
-                return false;
-            }
+            LOGI("output: using user-requested callback frames: %u", callbackFrameCount_);
         } else {
-            int32_t framesPerBurst = outputStreamPtr->getFramesPerBurst();
-            uint32_t po2 = 1;
-            while (po2 < static_cast<uint32_t>(framesPerBurst)) po2 <<= 1;
-            callbackFrameCount_ = po2;
-
-            bool isPo2 = (framesPerBurst > 0) &&
-                          ((framesPerBurst & (framesPerBurst - 1)) == 0);
-            if (!isPo2) {
-                LOGI("framesPerBurst=%d not power-of-2, reopening with framesPerCallback=%u",
-                     framesPerBurst, po2);
-                outputStreamPtr->close();
-                delete outputStreamPtr;
-                outputStreamPtr = nullptr;
-
-                outputBuilder.setFramesPerCallback(static_cast<int32_t>(po2));
-                result = outputBuilder.openStream(&outputStreamPtr);
-                if (result != oboe::Result::OK) {
-                    LOGE("Failed to reopen output stream with po2 callback: %s",
-                         oboe::convertToText(result));
-                    closeStreams();
+            const int32_t framesPerBurst = stream->getFramesPerBurst();
+            callbackFrameCount_ = nextPowerOfTwo(static_cast<uint32_t>(std::max(1, framesPerBurst)));
+            // Convolvers partition on power-of-two blocks, so a burst like 240 has
+            // to be rounded up even though AAudio would happily use it as is.
+            if (!isPowerOfTwo(framesPerBurst)) {
+                if (!reopenOutputStream(&stream, granted, api, rate, outputDeviceId_,
+                                        static_cast<int32_t>(callbackFrameCount_), this,
+                                        callbackFrameCount_)) {
+                    // reopenOutputStream already released the stream; the caller
+                    // tears down the input stream via closeStreams().
+                    LOGE("output: could not reopen with a power-of-two callback size");
                     return false;
                 }
             } else {
-                LOGI("framesPerBurst=%d already power-of-2", framesPerBurst);
+                LOGI("output: framesPerBurst=%d is already a power of two", framesPerBurst);
             }
         }
+
+        outputStream_.reset(stream);
+        outputChannels_ = std::max(1, outputStream_->getChannelCount());
+        outputFormatIsFloat_ = outputStream_->getFormat() == oboe::AudioFormat::Float;
+        if (outputStream_->getFormat() != oboe::AudioFormat::Float &&
+            outputStream_->getFormat() != oboe::AudioFormat::I16) {
+            LOGE("output: unexpected granted format %d, treating it as 16-bit PCM",
+                 static_cast<int>(outputStream_->getFormat()));
+        }
+        const int32_t grantedRate = outputStream_->getSampleRate();
+        if (grantedRate != static_cast<int32_t>(sampleRate_)) {
+            // Diagnostics only: the chain keeps running at sampleRate_ (the rate
+            // the input stream settled on), so a HAL that resamples or refuses
+            // the rate shows up here instead of as unexplained pitch drift.
+            LOGE("output: stream runs at %d Hz but the chain is at %d Hz (no resampling)",
+                 grantedRate, static_cast<int32_t>(sampleRate_));
+        }
+        if (outputChannels_ > 2) {
+            LOGE("output: %d channels granted, only the first two carry audio "
+                 "(the rest are muted)", outputChannels_);
+        }
+
+        LOGI("Output stream opened: label=[%s] api=%d sharing=%d perf=%d mmap=%d format=%d channels=%d rate=%d burst=%d exclusive+mmap=%d",
+             granted.label, static_cast<int>(outputStream_->getAudioApi()),
+             static_cast<int>(outputStream_->getSharingMode()),
+             static_cast<int>(outputStream_->getPerformanceMode()),
+             oboe::OboeExtensions::isMMapUsed(outputStream_.get()) ? 1 : 0,
+             static_cast<int>(outputStream_->getFormat()), outputChannels_,
+             outputStream_->getSampleRate(), outputStream_->getFramesPerBurst(),
+             grantsExclusiveMmap(outputStream_.get()) ? 1 : 0);
+        if (!grantsExclusiveMmap(outputStream_.get())) {
+            LOGI("output: no configuration was granted Exclusive+MMAP, running on the legacy "
+                 "shared path (higher round-trip latency)");
+        }
+        return true;
     }
+    return false;
+}
 
-    outputStream_.reset(outputStreamPtr);
-
-    // Start streams
-    result = inputStream_->requestStart();
+bool AudioEngine::startStreams() {
+    oboe::Result result = inputStream_->requestStart();
     if (result != oboe::Result::OK) {
         LOGE("Failed to start input stream: %s", oboe::convertToText(result));
-        closeStreams();
         return false;
     }
 
     result = outputStream_->requestStart();
     if (result != oboe::Result::OK) {
         LOGE("Failed to start output stream: %s", oboe::convertToText(result));
-        closeStreams();
         return false;
     }
 
-    // Allocate buffers
-    int32_t bufferSize = outputStream_->getBufferSizeInFrames();
-    inputBuffer_.resize(bufferSize);
-    outputBufferLeft_.resize(bufferSize);
-    outputBufferRight_.resize(bufferSize);
+    // Ask for the smallest buffer the HAL will honour before the tuner takes
+    // over: two bursts is the AAudio minimum and what LatencyTuner resets to.
+    requestMinimumBufferSize(outputStream_.get(), "output");
+    requestMinimumBufferSize(inputStream_.get(), "input");
 
-    LOGI("Audio streams created: %d Hz, buffer size: %d frames", 
-         static_cast<int>(sampleRate_), bufferSize);
-
+    // The tuner only grows the output buffer back when xruns appear, so a clean
+    // session keeps the minimum. It is created after requestStart() so the
+    // buffer size it sets is actually applied by AAudio.
+    latencyTuner_ = std::make_unique<oboe::LatencyTuner>(*outputStream_);
+    LOGI("output: latency tuner created, minimum=%d frames (%d bursts), capacity=%d frames",
+         latencyTuner_->getMinimumBufferSize(), kMinimumBursts,
+         outputStream_->getBufferCapacityInFrames());
     return true;
+}
+
+void AudioEngine::requestMinimumBufferSize(oboe::AudioStream* stream, const char* label) {
+    if (stream == nullptr) {
+        return;
+    }
+    const int32_t burst = stream->getFramesPerBurst();
+    const int32_t capacity = stream->getBufferCapacityInFrames();
+    if (burst <= 0 || capacity <= 0) {
+        LOGI("%s: cannot size the buffer (burst=%d capacity=%d)", label, burst, capacity);
+        return;
+    }
+    int32_t requested = kMinimumBursts * burst;
+    requested = std::max(burst, std::min(requested, capacity));
+
+    const int32_t previous = stream->getBufferSizeInFrames();
+    auto setResult = stream->setBufferSizeInFrames(requested);
+    if (!setResult) {
+        LOGI("%s: setBufferSizeInFrames(%d) not supported (%s), keeping %d frames", label, requested,
+             oboe::convertToText(setResult.error()), previous);
+        return;
+    }
+    LOGI("%s: buffer requested=%d granted=%d (was %d) burst=%d capacity=%d", label, requested,
+         setResult.value(), previous, burst, capacity);
+}
+
+void AudioEngine::prepareBuffers() {
+    size_t capacityFrames = 0;
+    if (outputStream_) {
+        const int32_t streamCapacity = outputStream_->getBufferCapacityInFrames();
+        if (streamCapacity > 0) {
+            capacityFrames = static_cast<size_t>(streamCapacity);
+        }
+    }
+    // The callback block size always has to fit as well: on the shared (legacy)
+    // path the HAL may hand out whole buffers larger than the burst.
+    capacityFrames = std::max(capacityFrames, static_cast<size_t>(callbackFrameCount_));
+    capacityFrames = std::max<size_t>(capacityFrames, 1);
+    bufferCapacityFrames_ = capacityFrames;
+
+    inputBuffer_.assign(capacityFrames, 0.0f);
+    outputBufferLeft_.assign(capacityFrames, 0.0f);
+    outputBufferRight_.assign(capacityFrames, 0.0f);
+
+    // The input scratch has to hold every granted channel: read() fills
+    // numFrames * channelCount samples.
+    const size_t scratchSamples = capacityFrames * static_cast<size_t>(std::max(2, inputChannels_));
+    inputStereoScratch_.assign(scratchSamples, 0.0f);
+    inputI16Scratch_.assign(scratchSamples, 0);
+
+    // The chain only ever sees one block per callback, so the capacity cap keeps
+    // its intermediate buffers bounded whatever the HAL reports.
+    chain_.prepareBuffers(
+        static_cast<uint32_t>(std::min(capacityFrames, kMaxBufferedFrames)));
+
+    LOGI("prepareBuffers: %zu frames preallocated (callback %u, input %d ch, output %d ch, "
+         "input format %s, output format %s)",
+         capacityFrames, callbackFrameCount_, inputChannels_, outputChannels_,
+         inputFormatIsFloat_ ? "float" : "i16", outputFormatIsFloat_ ? "float" : "i16");
+}
+
+int32_t AudioEngine::readInputIntoBuffer(int32_t numFrames) {
+    if (inputStream_ == nullptr) {
+        std::memset(inputBuffer_.data(), 0, static_cast<size_t>(numFrames) * sizeof(float));
+        return 0;
+    }
+
+    // Only the mono-float layout lands straight in inputBuffer_. The other
+    // granted layouts are read into preallocated scratch first, because read()
+    // fills numFrames * channelCount samples in the stream's own format.
+    const bool readsDirectlyToMono = inputFormatIsFloat_ && inputChannels_ == 1;
+    void* destination = inputBuffer_.data();
+    if (!readsDirectlyToMono) {
+        destination = inputFormatIsFloat_ ? static_cast<void*>(inputStereoScratch_.data())
+                                          : static_cast<void*>(inputI16Scratch_.data());
+    }
+
+    int32_t framesRead = 0;
+    auto result = inputStream_->read(destination, numFrames, 0);
+    if (result == oboe::Result::OK) {
+        framesRead = result.value();
+    }
+    framesRead = std::max(0, std::min(framesRead, numFrames));
+
+    if (readsDirectlyToMono) {
+        if (framesRead < numFrames) {
+            std::memset(inputBuffer_.data() + framesRead, 0,
+                        static_cast<size_t>(numFrames - framesRead) * sizeof(float));
+        }
+        return framesRead;
+    }
+
+    if (inputFormatIsFloat_) {
+        audioformat::interleavedToMono(inputStereoScratch_.data(), inputBuffer_.data(),
+                                       static_cast<size_t>(framesRead), inputChannels_);
+    } else if (inputChannels_ == 1) {
+        audioformat::i16ToFloatBuffer(inputI16Scratch_.data(), inputBuffer_.data(),
+                                      static_cast<size_t>(framesRead));
+    } else {
+        audioformat::interleavedI16ToMonoFloat(inputI16Scratch_.data(), inputBuffer_.data(),
+                                               static_cast<size_t>(framesRead), inputChannels_);
+    }
+    if (framesRead < numFrames) {
+        std::memset(inputBuffer_.data() + framesRead, 0,
+                    static_cast<size_t>(numFrames - framesRead) * sizeof(float));
+    }
+    return framesRead;
+}
+
+void AudioEngine::writeOutputBuffer(void* audioData, int32_t numFrames, int32_t numChannels) {
+    if (audioData == nullptr || numChannels <= 0) {
+        return;
+    }
+    // The HAL decides the stride: it may grant more channels than the two we
+    // render, so the frame walk uses the granted count instead of a hard-coded
+    // two. Left/right land in the first two lanes and any extra lane is muted
+    // (openOutputStream logs the layout once, off the audio thread).
+    const size_t stride = static_cast<size_t>(numChannels);
+    const bool mono = stride == 1;
+
+    if (outputFormatIsFloat_) {
+        float* output = static_cast<float*>(audioData);
+        for (int32_t i = 0; i < numFrames; ++i) {
+            float* frame = output + static_cast<size_t>(i) * stride;
+            if (mono) {
+                frame[0] = (outputBufferLeft_[i] + outputBufferRight_[i]) * 0.5f;
+                continue;
+            }
+            frame[0] = outputBufferLeft_[i];
+            frame[1] = outputBufferRight_[i];
+            for (size_t channel = 2; channel < stride; ++channel) {
+                frame[channel] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    int16_t* output = static_cast<int16_t*>(audioData);
+    for (int32_t i = 0; i < numFrames; ++i) {
+        int16_t* frame = output + static_cast<size_t>(i) * stride;
+        if (mono) {
+            frame[0] = audioformat::floatToI16(
+                (outputBufferLeft_[i] + outputBufferRight_[i]) * 0.5f);
+            continue;
+        }
+        frame[0] = audioformat::floatToI16(outputBufferLeft_[i]);
+        frame[1] = audioformat::floatToI16(outputBufferRight_[i]);
+        for (size_t channel = 2; channel < stride; ++channel) {
+            frame[channel] = 0;
+        }
+    }
+}
+
+oboe::DataCallbackResult AudioEngine::finishOutputCallback() {
+    // Must be the last thing the callback does: tune() may call
+    // setBufferSizeInFrames(), which AAudio applies to the next callback.
+    // OpenSL ES (and a HAL without buffer control) reports ErrorUnimplemented,
+    // which LatencyTuner remembers and reports on every following call: ignore
+    // it, tuning is simply unavailable on that path.
+    if (latencyTuner_) {
+        latencyTuner_->tune();
+    }
+    return oboe::DataCallbackResult::Continue;
+}
+
+void AudioEngine::startVstMonitor() {
+    if (vstMonitorRunning_.exchange(true)) {
+        return;
+    }
+    vstLastJiffies_.clear();
+    vstLastSampleNs_ = 0;
+    vstMonitorThread_ = std::thread([this] { vstMonitorLoop(); });
+}
+
+void AudioEngine::stopVstMonitor() {
+    vstMonitorRunning_.store(false);
+    if (vstMonitorThread_.joinable()) {
+        vstMonitorThread_.join();
+    }
+}
+
+void AudioEngine::vstMonitorLoop() {
+    LOGI("plugin monitor thread started tid=%ld (interval %d ms)", getTid(),
+         kPluginMonitorIntervalMs);
+    constexpr int kSlicesPerInterval = 10;
+    constexpr int kSliceMs = kPluginMonitorIntervalMs / kSlicesPerInterval;
+    while (vstMonitorRunning_.load()) {
+        for (int i = 0; i < kSlicesPerInterval && vstMonitorRunning_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kSliceMs));
+        }
+        if (!vstMonitorRunning_.load()) {
+            break;
+        }
+        sampleVstLoad();
+    }
+    LOGI("plugin monitor thread exited tid=%ld", getTid());
+}
+
+void AudioEngine::sampleVstLoad() {
+    const int64_t nowNs = monotonicNowNs();
+    uint64_t totalDeltaJiffies = 0;
+    int32_t totalUnderruns = 0;
+
+    // Holding a shared lock while reading /proc keeps add/remove out of the
+    // way, and try_lock makes this sample yield instead of blocking them.
+    const bool sampled = chain_.forEachPluginTryShared([&](IPlugin& plugin) {
+        totalUnderruns += plugin.getUnderrunCount();
+        const int pid = plugin.getSubprocessPid();
+        if (pid <= 0) {
+            return;
+        }
+        /* /proc/<pid>/stat fields utime (14) + stime (15) are cumulative
+         * jiffies (typically 100Hz on Android) since subprocess start. Read
+         * both, sum, diff against the last sample to derive jiffies per
+         * wall-second. */
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        FILE* file = std::fopen(path, "r");
+        if (file == nullptr) {
+            return;
+        }
+        char buffer[512];
+        const size_t got = std::fread(buffer, 1, sizeof(buffer) - 1, file);
+        std::fclose(file);
+        if (got == 0) {
+            return;
+        }
+        buffer[got] = 0;
+        /* Skip past "comm" (in parens — the name can contain spaces), then we
+         * are at field 3 (state). utime is field 14, stime is field 15. */
+        char* endOfComm = std::strrchr(buffer, ')');
+        if (endOfComm == nullptr) {
+            return;
+        }
+        unsigned long long fields[16] = {0};
+        const int parsed = std::sscanf(endOfComm + 1,
+                                       " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+                                       &fields[13], &fields[14]);
+        if (parsed != 2) {
+            return;
+        }
+        const uint64_t current = fields[13] + fields[14];
+        auto entry = vstLastJiffies_.find(pid);
+        if (entry != vstLastJiffies_.end()) {
+            totalDeltaJiffies += current - entry->second;
+            entry->second = current;
+        } else {
+            vstLastJiffies_[pid] = current;
+        }
+    });
+
+    if (!sampled) {
+        return;
+    }
+
+    if (vstLastSampleNs_ > 0 && nowNs > static_cast<int64_t>(vstLastSampleNs_)) {
+        const uint64_t elapsedNs = static_cast<uint64_t>(nowNs) - vstLastSampleNs_;
+        /* sysconf(_SC_CLK_TCK) is the jiffies-per-second on this system; on
+         * Android it is 100. Compute the fraction of one CPU's wall time the
+         * subprocesses used in aggregate. */
+        long clockTicks = sysconf(_SC_CLK_TCK);
+        if (clockTicks <= 0) {
+            clockTicks = 100;
+        }
+        const double seconds = static_cast<double>(elapsedNs) / 1.0e9;
+        double fraction =
+            (static_cast<double>(totalDeltaJiffies) / static_cast<double>(clockTicks)) / seconds;
+        if (fraction > 1.0) {
+            fraction = 1.0;
+        }
+        vstCpuLoad_.store(static_cast<float>(fraction));
+    }
+    vstLastSampleNs_ = static_cast<uint64_t>(nowNs);
+    vstUnderruns_.store(totalUnderruns);
 }
 
 void AudioEngine::closeStreams() {
     LOGI("closeStreams() ENTER tid=%ld (caller thread; AudioTrack callback is different tid)", getTid());
+
+    // The monitor thread walks the plugin chain and must be gone before the
+    // streams (and later the chain) are torn down.
+    stopVstMonitor();
     
     // First, signal the callback to stop immediately to prevent new callbacks
     // from starting while we're tearing down.
@@ -759,6 +1262,10 @@ void AudioEngine::closeStreams() {
         std::this_thread::sleep_for(std::chrono::milliseconds(kStreamCloseSleepMs));
         LOGI("closeStreams() outputStream_.reset() NOW tid=%ld", getTid());
         outputStream_.reset();
+        // The tuner holds a reference to the stream and calls into it from
+        // tune(); it is destroyed here, once the callback thread is drained,
+        // so ~LatencyTuner cannot reach a freed AAudio stream.
+        latencyTuner_.reset();
         LOGI("closeStreams() output stream destroyed tid=%ld", getTid());
     }
     LOGI("closeStreams() done");

@@ -20,6 +20,7 @@
 #include "AudioRecorder.h"
 #include <android/log.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -66,13 +67,19 @@ bool AudioRecorder::startRecording(const std::string& rawPath, const std::string
         return false;
     }
 
+    // Preallocate the interleave scratch so feedAudio() never allocates on the
+    // audio thread: kMaxFeedFrames stereo frames is far above any real HAL block.
+    interleaveBuffer_.assign(static_cast<size_t>(kMaxFeedFrames) * 2, 0.0f);
+
     // Write placeholder WAV headers (will be finalized on stop)
     writeWavHeader(rawFile_, 1, static_cast<uint32_t>(sampleRate));
     writeWavHeader(processedFile_, 2, static_cast<uint32_t>(sampleRate));
 
-    // Start writer thread
+    // Start writer thread. The release store publishes the interleave scratch
+    // that was just (re)sized above: feedAudio() acquires it before writing, so
+    // the audio thread cannot observe a recording_=true with a stale buffer.
     writerRunning_.store(true);
-    recording_.store(true);
+    recording_.store(true, std::memory_order_release);
     writerThread_ = std::thread(&AudioRecorder::writerLoop, this);
 
     LOGI("Recording started: raw=%s processed=%s sr=%.0f", rawPath.c_str(), processedPath.c_str(), sampleRate);
@@ -82,7 +89,7 @@ bool AudioRecorder::startRecording(const std::string& rawPath, const std::string
 void AudioRecorder::stopRecording() {
     if (!recording_.load()) return;
 
-    recording_.store(false);
+    recording_.store(false, std::memory_order_release);
     writerRunning_.store(false);
 
     if (writerThread_.joinable()) {
@@ -115,28 +122,43 @@ double AudioRecorder::getDurationSec() const {
 }
 
 void AudioRecorder::feedAudio(const float* rawMono, const float* processedL, const float* processedR, int32_t numFrames) {
-    if (!recording_.load(std::memory_order_relaxed)) return;
+    // Acquire pairs with startRecording()'s release store: it guarantees that the
+    // preallocated interleaveBuffer_ written there is visible on the audio thread.
+    if (!recording_.load(std::memory_order_acquire)) return;
+    if (rawMono == nullptr || processedL == nullptr || processedR == nullptr || numFrames <= 0) return;
 
     // Write raw mono
     rawRing_.write(rawMono, static_cast<size_t>(numFrames));
 
-    // Interleave stereo into stack-local buffer if small enough, otherwise use member
-    size_t stereoSamples = static_cast<size_t>(numFrames) * 2;
-    float stackBuf[1024];
+    // Interleave stereo into the stack buffer for the common small blocks and
+    // into the preallocated member buffer for larger ones. Never resizes: on the
+    // audio thread a resize is a malloc, and an oversized block is truncated
+    // (the ring would drop it anyway) rather than allocating.
+    constexpr int32_t kStackInterleaveFrames = 512;
+    float stackBuf[kStackInterleaveFrames * 2];
     float* buf;
-    if (stereoSamples <= 1024) {
+    int32_t framesToWrite = numFrames;
+    if (numFrames <= kStackInterleaveFrames) {
         buf = stackBuf;
     } else {
-        // Very large buffer — use heap (should be rare at typical buffer sizes)
-        interleaveBuffer_.resize(stereoSamples);
+        if (static_cast<size_t>(numFrames) * 2 > interleaveBuffer_.size()) {
+            static auto lastTruncateLog = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - lastTruncateLog).count() >= 1.0) {
+                lastTruncateLog = now;
+                LOGE("feedAudio: %d frames exceed the preallocated %zu interleave samples, "
+                     "recording truncated", numFrames, interleaveBuffer_.size());
+            }
+            framesToWrite = static_cast<int32_t>(interleaveBuffer_.size() / 2);
+        }
         buf = interleaveBuffer_.data();
     }
 
-    for (int32_t i = 0; i < numFrames; ++i) {
+    for (int32_t i = 0; i < framesToWrite; ++i) {
         buf[i * 2] = processedL[i];
         buf[i * 2 + 1] = processedR[i];
     }
-    processedRing_.write(buf, stereoSamples);
+    processedRing_.write(buf, static_cast<size_t>(framesToWrite) * 2);
 
     totalRawFrames_.fetch_add(static_cast<size_t>(numFrames), std::memory_order_relaxed);
 }
