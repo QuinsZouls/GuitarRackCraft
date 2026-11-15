@@ -71,6 +71,19 @@ public:
      * Must be called before enumeratePlugins() or createPlugin().
      */
     virtual bool initialize() = 0;
+
+    /**
+     * Re-scan for plugins so entries added or removed on disk since
+     * initialize() are reflected without recreating the factory.
+     *
+     * Default: run initialize() again, which is right for factories that
+     * rebuild their whole state from scratch. Factories that can scan
+     * incrementally override this to keep state that live plugin instances
+     * still point into (LV2: the LilvWorld).
+     *
+     * @return true if the enumeration is usable afterwards
+     */
+    virtual bool refresh() { return initialize(); }
 };
 
 } // namespace guitarrackcraft

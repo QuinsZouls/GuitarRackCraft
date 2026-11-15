@@ -67,6 +67,10 @@ data class PluginInfo(
     val name: String = "",
     val format: String = "",
     val ports: List<PortInfo> = emptyList(),
+    /** Absolute path of the bundle this plugin was loaded from (no trailing
+     *  separator), empty for formats without bundles. Set for every LV2 plugin,
+     *  so a URI can be mapped back to `filesDir/lv2_user/<id>`. */
+    val bundlePath: String = "",
     /** If non-empty, path to bundle directory for modgui (file:// base for WebView). */
     val modguiBasePath: String = "",
     /** Relative path to modgui icon HTML (e.g. modgui/icon-gxmicroamp.html). Only set if modguiBasePath is set. */

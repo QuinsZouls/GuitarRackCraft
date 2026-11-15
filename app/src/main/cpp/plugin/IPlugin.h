@@ -91,6 +91,11 @@ struct PluginInfo {
     std::string name;
     std::string format;  // "LV2", "CLAP", "VST3", etc.
     std::vector<PortInfo> ports;
+    /** Absolute path of the bundle this plugin was loaded from, without a
+     *  trailing separator; empty for formats without bundles. Unlike
+     *  [modguiBasePath] it is always set, so the UI can map a plugin back to the
+     *  directory it came from (imported bundles, removal). */
+    std::string bundlePath;
     /** If non-empty, this plugin has modgui; path to bundle directory (no trailing slash). */
     std::string modguiBasePath;
     /** Relative path to modgui icon HTML (e.g. modgui/icon-gxmicroamp.html). Only set if modguiBasePath is set. */

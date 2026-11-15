@@ -39,6 +39,7 @@
 #include "../plugin/IPlugin.h"
 #include "../plugin/IPluginFactory.h"
 #include "../plugin/lv2/LV2PluginFactory.h"
+#include "../plugin/lv2/LV2WorldLock.h"
 
 // VST hosting (full flavor only — gated by CMake -DHAS_VST_HOST from
 // productFlavors.full.externalNativeBuild). The header is :vsthost_lib's
@@ -86,6 +87,7 @@ static struct {
     jfieldID piName = nullptr;
     jfieldID piFormat = nullptr;
     jfieldID piPorts = nullptr;
+    jfieldID piBundlePath = nullptr;
     jfieldID piModguiBasePath = nullptr;
     jfieldID piModguiIconTemplate = nullptr;
     jfieldID piHasX11Ui = nullptr;
@@ -132,6 +134,7 @@ static bool ensureJniCache(JNIEnv* env) {
     g_jni.piName = env->GetFieldID(g_jni.pluginInfoClass, "name", "Ljava/lang/String;");
     g_jni.piFormat = env->GetFieldID(g_jni.pluginInfoClass, "format", "Ljava/lang/String;");
     g_jni.piPorts = env->GetFieldID(g_jni.pluginInfoClass, "ports", "Ljava/util/List;");
+    g_jni.piBundlePath = env->GetFieldID(g_jni.pluginInfoClass, "bundlePath", "Ljava/lang/String;");
     g_jni.piModguiBasePath = env->GetFieldID(g_jni.pluginInfoClass, "modguiBasePath", "Ljava/lang/String;");
     g_jni.piModguiIconTemplate = env->GetFieldID(g_jni.pluginInfoClass, "modguiIconTemplate", "Ljava/lang/String;");
     g_jni.piHasX11Ui = env->GetFieldID(g_jni.pluginInfoClass, "hasX11Ui", "Z");
@@ -370,12 +373,14 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeRefreshPluginRegistry
         LOGE("nativeRefreshPluginRegistry: registry not initialized");
         return JNI_FALSE;
     }
-    // Re-runs each factory's initialize() (which for VstFactory re-reads
-    // filesDir/vst_plugins/registry.json) and rebuilds pluginCache_ from
-    // their enumeratePlugins(). Called from Kotlin after the Manage VST UI
-    // imports or removes a plugin so the rack browser sees the new entry
-    // without an engine restart.
-    const bool ok = g_ctx->pluginRegistry->initializeAll();
+    // Re-scans every factory so the rack browser sees imported or removed
+    // plugins without an engine restart: VstFactory re-reads
+    // filesDir/vst_plugins/registry.json, the LV2 factory loads bundles that
+    // appeared under its scan roots (including filesDir/lv2_user) into its
+    // existing LilvWorld. Then pluginCache_ is rebuilt from both.
+    // Called from Kotlin after the Manage VST / Import LV2 UI changes the
+    // plugin set.
+    const bool ok = g_ctx->pluginRegistry->refreshAll();
     LOGI("nativeRefreshPluginRegistry: ok=%d", ok ? 1 : 0);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
@@ -386,6 +391,14 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeStartEngine(JNIEnv* e
         LOGE("Audio engine not initialized");
         return JNI_FALSE;
     }
+
+    // Starting the engine activates every plugin in the chain
+    // (PluginChain::setSampleRate → IPlugin::activate → lilv_plugin_instantiate),
+    // which reads the world: world lock so an import cannot rebuild it under us
+    // (LV2WorldLock.h). The Oboe streams started by the same call never touch
+    // the world, so holding the lock across them is safe; an import that arrives
+    // meanwhile waits for the start to finish instead of corrupting the world.
+    guitarrackcraft::lv2world::Guard worldLock = guitarrackcraft::lv2world::guard();
 
     return g_ctx->audioEngine->start(static_cast<float>(sampleRate),
                                      static_cast<int32_t>(inputDeviceId),
@@ -610,6 +623,7 @@ jobject createPluginInfoObject(JNIEnv* env, const PluginInfo& info) {
     setString(g_jni.piId, info.id);
     setString(g_jni.piName, info.name);
     setString(g_jni.piFormat, info.format);
+    setString(g_jni.piBundlePath, info.bundlePath);
     setString(g_jni.piModguiBasePath, info.modguiBasePath);
     setString(g_jni.piModguiIconTemplate, info.modguiIconTemplate);
     setString(g_jni.piX11UiBinaryPath, info.x11UiBinaryPath);
@@ -666,6 +680,15 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeAddPluginToRack(JNIEn
     if (!g_ctx || !g_ctx->pluginRegistry || !g_ctx->audioEngine) {
         return -1;
     }
+
+    // World lock for the whole call: createPlugin() walks the LilvWorld
+    // (lilv_new_uri, lilv_lib_open, lilv_plugin_instantiate) and addPlugin()
+    // re-activates the plugin on the chain, which instantiates it again. An
+    // import running nativeRefreshPluginRegistry() at the same time mutates that
+    // same world and lilv/sord are not thread safe — not even reader against
+    // reader. Order: world → PluginRegistry cache → PluginChain
+    // (see LV2WorldLock.h).
+    guitarrackcraft::lv2world::Guard worldLock = guitarrackcraft::lv2world::guard();
 
     const char* idStr = env->GetStringUTFChars(pluginId, nullptr);
     if (!idStr) {
@@ -854,6 +877,11 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeProcessFile(JNIEnv* e
         return JNI_FALSE;
     }
 
+    /* Offline render re-activates the chain (PluginChain::setSampleRate →
+     * IPlugin::activate → lilv_plugin_instantiate), which reads the world: same
+     * world lock as the live start, exclusive against an import. */
+    guitarrackcraft::lv2world::Guard worldLock = guitarrackcraft::lv2world::guard();
+
     /* The output file has to carry the same global gain the live engine applies,
      * so the two dB values travel with the round-trip gain staging request. */
     bool result = g_ctx->offlineProcessor->processFile(std::string(inputStr), std::string(outputStr),
@@ -878,6 +906,11 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeGetRackPluginInfo(JNI
     if (!g_ctx->audioEngine) {
         return nullptr;
     }
+
+    // IPlugin::getInfo() reads — and interns URIDs in — the LilvWorld (uri,
+    // name, ports, UIs): world lock, exclusive against every other world user
+    // (LV2WorldLock.h).
+    guitarrackcraft::lv2world::Guard worldLock = guitarrackcraft::lv2world::guard();
 
     IPlugin* plugin = g_ctx->audioEngine->getChain().getPlugin(index);
     if (!plugin) {
@@ -1301,6 +1334,10 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeSaveChainState(JNIEnv
     if (!g_ctx || !g_ctx->audioEngine) {
         return nullptr;
     }
+
+    // Preset export reads every plugin's info (getInfo → world nodes): world
+    // lock against a concurrent import (LV2WorldLock.h).
+    guitarrackcraft::lv2world::Guard worldLock = guitarrackcraft::lv2world::guard();
 
     auto chainState = g_ctx->audioEngine->getChain().saveChainState();
     std::string json = serializeChainStateToJson(chainState);

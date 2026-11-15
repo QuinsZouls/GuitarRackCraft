@@ -21,6 +21,7 @@
 #define GUITARRACKCRAFT_LV2_PLUGIN_FACTORY_H
 
 #include "../IPluginFactory.h"
+#include "LV2BundleScanner.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -54,11 +55,31 @@ public:
     std::unique_ptr<IPlugin> createPlugin(const std::string& pluginId) override;
     bool initialize() override;
 
+    /**
+     * Load bundles that appeared under the scan roots since [initialize] into
+     * the existing world and rebuild the enumeration. The world is never
+     * recreated: live LV2Plugin instances hold pointers into it.
+     */
+    bool refresh() override;
+
 private:
 #if defined(HAVE_LV2) && HAVE_LV2 == 1
     LilvWorld* world_;
-    void scanPlugins(const std::string& bundlePath);
-    void rewriteManifestPaths(const std::string& bundlePath);
+    /** Roots scanned by [initialize] and [refresh], in scan order. */
+    std::vector<std::string> scanRoots_;
+    LV2BundleScanner bundleScanner_;
+    std::vector<std::string> buildScanRoots() const;
+    /** Load every bundle under [scanRoots_] that this world has never seen,
+     *  after pointing its manifest at an exec-permitted binary.
+     *  @return number of newly loaded bundles. */
+    int scanRoots();
+    /** Rebuild plugins_ from the world, one entry per plugin URI. */
+    void rebuildPluginInfos();
+    void loadSpecificationsAndClasses();
+    /** Point lv2:binary (and the bundle's guiext:/ui:binary) at an absolute path
+     *  for the one bundle in [bundleDir]. Idempotent; only called for bundles
+     *  that are about to be loaded for the first time. */
+    void rewriteBundleManifest(const std::string& bundleDir);
     int rewriteGuiextBinaryPaths(const std::string& bundleDir);
     /** If modgui.ttl exists for this plugin, set info.modguiBasePath and info.modguiIconTemplate. */
     void discoverModgui(const LilvPlugin* plugin, PluginInfo& info);
@@ -66,8 +87,6 @@ private:
     void discoverX11UI(const LilvPlugin* plugin, PluginInfo& info);
 #else
     LilvWorld_* world_;
-    void scanPlugins(const std::string& bundlePath);
-    void rewriteManifestPaths(const std::string& bundlePath);
 #endif
     std::string lv2Path_;
     std::string nativeLibDir_;

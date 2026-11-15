@@ -70,15 +70,27 @@ std::string resolveX11UIBinaryPath(const LilvUI* ui, const LilvPlugin* plugin, L
     return result;
 }
 
-bool discoverModguiMetadata(const LilvPlugin* plugin, PluginInfo& info) {
+std::string pluginBundlePath(const LilvPlugin* plugin) {
+    if (!plugin) return {};
+
     const LilvNode* bundleUriNode = lilv_plugin_get_bundle_uri(plugin);
-    if (!bundleUriNode) return false;
-    const char* bundleUri = lilv_node_as_string(bundleUriNode);
-    if (!bundleUri) return false;
-    char* bundlePath = lilv_file_uri_parse(bundleUri, nullptr);
-    if (!bundlePath) return false;
+    if (!bundleUriNode) return {};
+
+    char* bundlePath = lilv_file_uri_parse(lilv_node_as_string(bundleUriNode), nullptr);
+    if (!bundlePath) return {};
 
     std::string bundleStr(bundlePath);
+    lilv_free(bundlePath);
+    while (bundleStr.size() > 1 && bundleStr.back() == '/') {
+        bundleStr.pop_back();
+    }
+    return bundleStr;
+}
+
+bool discoverModguiMetadata(const LilvPlugin* plugin, PluginInfo& info) {
+    const std::string bundleStr = pluginBundlePath(plugin);
+    if (bundleStr.empty()) return false;
+
     std::string modguiTtlPath = bundleStr + "/modgui.ttl";
     std::ifstream f(modguiTtlPath);
     if (!f.good()) {
@@ -86,7 +98,6 @@ bool discoverModguiMetadata(const LilvPlugin* plugin, PluginInfo& info) {
         modguiTtlPath = bundleStr + "/modguis.ttl";
         f.open(modguiTtlPath);
         if (!f.good()) {
-            lilv_free(bundlePath);
             return false;
         }
     }
@@ -97,7 +108,6 @@ bool discoverModguiMetadata(const LilvPlugin* plugin, PluginInfo& info) {
 
     size_t idPos = content.find(info.id);
     if (content.empty() || idPos == std::string::npos) {
-        lilv_free(bundlePath);
         return false;
     }
 
@@ -105,26 +115,21 @@ bool discoverModguiMetadata(const LilvPlugin* plugin, PluginInfo& info) {
     const std::string key = "modgui:iconTemplate";
     size_t keyPos = content.find(key, idPos);
     if (keyPos == std::string::npos) {
-        lilv_free(bundlePath);
         return false;
     }
     size_t openAngle = content.find('<', keyPos);
     if (openAngle == std::string::npos) {
-        lilv_free(bundlePath);
         return false;
     }
     size_t closeAngle = content.find('>', openAngle);
     if (closeAngle == std::string::npos) {
-        lilv_free(bundlePath);
         return false;
     }
     info.modguiIconTemplate = content.substr(openAngle + 1, closeAngle - openAngle - 1);
     if (info.modguiIconTemplate.empty()) {
-        lilv_free(bundlePath);
         return false;
     }
-    info.modguiBasePath = bundlePath;
-    lilv_free(bundlePath);
+    info.modguiBasePath = bundleStr;
     return true;
 }
 

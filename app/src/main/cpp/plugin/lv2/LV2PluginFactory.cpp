@@ -70,36 +70,108 @@ bool LV2PluginFactory::initialize() {
         LOGE("Failed to create LV2 world");
         return false;
     }
-    
-    // Scan path set by nativeSetLv2Path() (extracted assets), then fallback paths
-    LOGI("LV2 scan path: '%s'", lv2Path_.c_str());
-    if (!lv2Path_.empty()) {
-        // Create symlinks from bundle dirs to native lib dir before scanning
-        if (!nativeLibDir_.empty()) {
-            rewriteManifestPaths(lv2Path_);
-        }
-        scanPlugins(lv2Path_);
+
+    scanRoots_ = buildScanRoots();
+    LOGI("LV2 scan roots: %zu", scanRoots_.size());
+    for (const std::string& root : scanRoots_) {
+        LOGI("LV2 scan path: '%s'", root.c_str());
     }
-    const char* fallbackPaths[] = {
-        "/data/data/com.varcain.guitarrackcraft/files/lv2",
-        "/sdcard/Android/data/com.varcain.guitarrackcraft/files/lv2",
-        nullptr
+
+    scanRoots();
+    loadSpecificationsAndClasses();
+    rebuildPluginInfos();
+
+    initialized_ = true;
+    LOGI("LV2 plugin factory initialized: %zu plugins found", plugins_.size());
+    return true;
+}
+
+bool LV2PluginFactory::refresh() {
+    if (!initialized_) {
+        return initialize();
+    }
+    if (!world_) {
+        return false;
+    }
+
+    const int loaded = scanRoots();
+    if (loaded > 0) {
+        // A new bundle can declare new specifications and plugin classes, so the
+        // world's tables have to be refreshed before the enumeration is rebuilt.
+        // Both calls are idempotent: lilv skips files it already loaded and
+        // ignores plugin classes whose URI is already in its tree.
+        loadSpecificationsAndClasses();
+    }
+    rebuildPluginInfos();
+
+    LOGI("LV2 plugin factory refreshed: %d new bundles, %zu plugins total",
+         loaded, plugins_.size());
+    return true;
+}
+
+std::vector<std::string> LV2PluginFactory::buildScanRoots() const {
+    std::vector<std::string> roots;
+    const auto add = [&roots](const std::string& path) {
+        if (path.empty()) {
+            return;
+        }
+        for (const std::string& existing : roots) {
+            if (existing == path) {
+                return;
+            }
+        }
+        roots.push_back(path);
     };
-    for (int i = 0; fallbackPaths[i]; ++i) {
-        if (lv2Path_ != fallbackPaths[i]) {
-            scanPlugins(fallbackPaths[i]);
-        }
+
+    // Extracted assets (nativeSetLv2Path) and user-imported bundles, then the
+    // legacy fallbacks kept for installs that never set a path.
+    add(lv2Path_);
+    if (!filesDir_.empty()) {
+        add(filesDir_ + "/lv2_user");
     }
-    
-    // Parse specifications and plugin classes so get_all_plugins() returns discovered plugins
+    add("/data/data/com.varcain.guitarrackcraft/files/lv2");
+    add("/sdcard/Android/data/com.varcain.guitarrackcraft/files/lv2");
+    return roots;
+}
+
+int LV2PluginFactory::scanRoots() {
+    if (!world_) {
+        return 0;
+    }
+
+    int loaded = 0;
+    for (const std::string& root : scanRoots_) {
+        // Only bundles this world has never seen need their manifests pointed at
+        // an exec-permitted binary. Rewriting the whole root on every refresh
+        // re-read and re-parsed every manifest for nothing (the rewrite itself
+        // is idempotent, the I/O is not free), so the scanner decides first.
+        const std::vector<std::string> newBundles = bundleScanner_.findNewBundles(root);
+        if (newBundles.empty()) {
+            continue;
+        }
+        if (!nativeLibDir_.empty()) {
+            for (const std::string& bundleDir : newBundles) {
+                rewriteBundleManifest(bundleDir);
+            }
+        }
+        loaded += bundleScanner_.loadBundles(world_, newBundles);
+    }
+    return loaded;
+}
+
+void LV2PluginFactory::loadSpecificationsAndClasses() {
+    // Parse specifications and plugin classes so lilv_world_get_all_plugins()
+    // returns discovered plugins.
     lilv_world_load_specifications(world_);
     lilv_world_load_plugin_classes(world_);
-    
-    // Enumerate all discovered plugins
-    const LilvPlugins* plugins = lilv_world_get_all_plugins(world_);
-    int x11Count = 0, modguiCount = 0;
-    LILV_FOREACH(plugins, i, plugins) {
-        const LilvPlugin* plugin = lilv_plugins_get(plugins, i);
+}
+
+void LV2PluginFactory::rebuildPluginInfos() {
+    plugins_.clear();
+    int x11Count = 0;
+    int modguiCount = 0;
+
+    LV2BundleScanner::forEachPlugin(world_, [&](const LilvPlugin* plugin) {
         PluginInfo info;
 
         const LilvNode* uri = lilv_plugin_get_uri(plugin);
@@ -112,6 +184,11 @@ bool LV2PluginFactory::initialize() {
             info.name = lilv_node_as_string(name);
         }
         info.format = "LV2";
+
+        // Absolute bundle directory, always available (modguiBasePath is not:
+        // only modgui bundles have it). The UI uses it to attribute an imported
+        // plugin to the directory the user imported it into.
+        info.bundlePath = pluginBundlePath(plugin);
 
         // Get port count for info
         uint32_t numPorts = lilv_plugin_get_num_ports(plugin);
@@ -127,12 +204,10 @@ bool LV2PluginFactory::initialize() {
         if (!info.modguiBasePath.empty()) modguiCount++;
 
         plugins_.push_back(info);
-    }
+    });
 
-    initialized_ = true;
-    LOGI("LV2 plugin factory initialized: %zu plugins found (x11=%d, modgui=%d)",
+    LOGI("LV2 plugin factory: %zu plugins (x11=%d, modgui=%d)",
          plugins_.size(), x11Count, modguiCount);
-    return true;
 }
 
 std::vector<PluginInfo> LV2PluginFactory::enumeratePlugins() {
@@ -202,54 +277,6 @@ void LV2PluginFactory::discoverX11UI(const LilvPlugin* plugin, PluginInfo& info)
     lilv_node_free(x11UiClass);
 }
 
-void LV2PluginFactory::scanPlugins(const std::string& bundlePath) {
-    if (bundlePath.empty() || !world_) {
-        return;
-    }
-
-    DIR* dir = opendir(bundlePath.c_str());
-    if (!dir) {
-        LOGE("scanPlugins: opendir failed path='%s' errno=%d (%s)", bundlePath.c_str(), errno, std::strerror(errno));
-        return;
-    }
-
-    int bundleCount = 0;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        std::string fullPath = bundlePath + "/" + entry->d_name;
-        struct stat st;
-        if (stat(fullPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-            // Check if it's an LV2 bundle (has manifest.ttl)
-            std::string manifestPath = fullPath + "/manifest.ttl";
-            if (access(manifestPath.c_str(), F_OK) == 0) {
-                // This is an LV2 bundle - load it (API requires URI with trailing slash)
-                std::string pathWithSlash = fullPath;
-                if (pathWithSlash.back() != '/') {
-                    pathWithSlash += '/';
-                }
-                LilvNode* bundleUri = lilv_new_file_uri(world_, nullptr, pathWithSlash.c_str());
-                if (bundleUri) {
-                    lilv_world_load_bundle(world_, bundleUri);
-                    bundleCount++;
-                    lilv_node_free(bundleUri);
-                }
-            } else {
-                // Not a bundle, recurse into subdirectories (e.g., GxPlugins.lv2/)
-                scanPlugins(fullPath);
-            }
-        }
-    }
-
-    closedir(dir);
-    if (bundleCount > 0) {
-        LOGI("scanPlugins: loaded %d bundles from %s", bundleCount, bundlePath.c_str());
-    }
-}
-
 // Returns number of UI binary paths rewritten in this bundle directory.
 int LV2PluginFactory::rewriteGuiextBinaryPaths(const std::string& bundleDir) {
     DIR* dir = opendir(bundleDir.c_str());
@@ -310,12 +337,18 @@ int LV2PluginFactory::rewriteGuiextBinaryPaths(const std::string& bundleDir) {
 
                 std::string nativeLibPath = nativeLibDir_ + "/lib" + soName;
                 std::string pluginLibPath = pluginLibDir_.empty() ? std::string() : (pluginLibDir_ + "/lib" + soName);
+                std::string bundleUiPath = bundleDir + "/" + soName;
                 std::string resolvedPath;
 
                 if (access(nativeLibPath.c_str(), F_OK) == 0) {
                     resolvedPath = nativeLibPath;
                 } else if (!pluginLibPath.empty() && access(pluginLibPath.c_str(), F_OK) == 0) {
                     resolvedPath = pluginLibPath;
+                } else if (access(bundleUiPath.c_str(), F_OK) == 0) {
+                    // Imported bundles ship their UI binary inside the bundle;
+                    // lilv resolves that relative reference by itself, an
+                    // absolute one keeps working when the bundle is moved.
+                    resolvedPath = bundleUiPath;
                 } else {
                     searchPos = gt + 1;
                     continue;
@@ -343,105 +376,81 @@ int LV2PluginFactory::rewriteGuiextBinaryPaths(const std::string& bundleDir) {
     return rewriteCount;
 }
 
-void LV2PluginFactory::rewriteManifestPaths(const std::string& basePath) {
-    DIR* dir = opendir(basePath.c_str());
-    if (!dir) return;
+void LV2PluginFactory::rewriteBundleManifest(const std::string& bundleDir) {
+    const std::string manifestPath = bundleDir + "/manifest.ttl";
+    FILE* f = fopen(manifestPath.c_str(), "r");
+    if (!f) return;
 
-    int rewriteCount = 0;
-    int uiRewriteCount = 0;
-    int missingCount = 0;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (entry->d_name[0] == '.') continue;
-
-        std::string fullPath = basePath + "/" + entry->d_name;
-        struct stat st;
-        if (stat(fullPath.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-
-        std::string manifestPath = fullPath + "/manifest.ttl";
-        if (access(manifestPath.c_str(), F_OK) == 0) {
-            // It's an LV2 bundle - rewrite manifest.ttl to point lv2:binary
-            // to the native lib dir so dlopen uses an exec-permitted path
-            FILE* f = fopen(manifestPath.c_str(), "r");
-            if (!f) continue;
-
-            // Read entire manifest
-            std::string content;
-            char buf[1024];
-            while (fgets(buf, sizeof(buf), f)) {
-                content += buf;
-            }
-            fclose(f);
-
-            // Find lv2:binary <soname.so> and replace with absolute path
-            size_t binaryPos = content.find("lv2:binary");
-            if (binaryPos == std::string::npos) continue;
-
-            size_t lt = content.find('<', binaryPos);
-            size_t gt = content.find('>', lt != std::string::npos ? lt : 0);
-            if (lt == std::string::npos || gt == std::string::npos) continue;
-
-            std::string binaryUri = content.substr(lt + 1, gt - lt - 1);
-            size_t lastSlash = binaryUri.rfind('/');
-            std::string soName = (lastSlash != std::string::npos)
-                ? binaryUri.substr(lastSlash + 1) : binaryUri;
-
-            if (soName.size() <= 3 || soName.substr(soName.size() - 3) != ".so") continue;
-
-            std::string nativeLibPath = nativeLibDir_ + "/lib" + soName;
-            std::string pluginLibPath = pluginLibDir_.empty() ? std::string() : (pluginLibDir_ + "/lib" + soName);
-            std::string bundleSoPath = fullPath + "/" + soName;
-
-            // Resolve which path to use for lv2:binary.
-            // Search order: nativeLibDir (full flavor) → pluginLibDir (PAD extraction) → bundle fallback
-            std::string binaryUriValue;
-            bool haveInLibDir = (access(nativeLibPath.c_str(), F_OK) == 0);
-            bool haveInPluginDir = (!pluginLibPath.empty() && access(pluginLibPath.c_str(), F_OK) == 0);
-            bool haveInBundle = (access(bundleSoPath.c_str(), F_OK) == 0);
-
-            if (haveInLibDir) {
-                binaryUriValue = "file://" + nativeLibPath;
-            } else if (haveInPluginDir) {
-                binaryUriValue = "file://" + pluginLibPath;
-            } else if (haveInBundle) {
-                binaryUriValue = "file://" + bundleSoPath;
-            } else {
-                missingCount++;
-                continue;
-            }
-
-            // Replace ALL occurrences of <soname.so> (multi-plugin bundles share the same binary)
-            std::string oldToken = "<" + binaryUri + ">";
-            std::string newToken = "<" + binaryUriValue + ">";
-            std::string newContent = content;
-            size_t pos = 0;
-            while ((pos = newContent.find(oldToken, pos)) != std::string::npos) {
-                newContent.replace(pos, oldToken.size(), newToken);
-                pos += newToken.size();
-            }
-
-            // Write back
-            FILE* fw = fopen(manifestPath.c_str(), "w");
-            if (fw) {
-                fwrite(newContent.c_str(), 1, newContent.size(), fw);
-                fclose(fw);
-                rewriteCount++;
-            } else {
-                LOGE("Failed to rewrite manifest: %s: %s", manifestPath.c_str(), strerror(errno));
-            }
-
-            // Also rewrite guiext:binary in all .ttl files in this bundle
-            uiRewriteCount += rewriteGuiextBinaryPaths(fullPath);
-        } else {
-            // Not a bundle, recurse (e.g. GxPlugins.lv2/)
-            rewriteManifestPaths(fullPath);
-        }
+    std::string content;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), f)) {
+        content += buf;
     }
-    closedir(dir);
-    if (rewriteCount > 0 || missingCount > 0) {
-        LOGI("rewriteManifestPaths: %d manifests rewritten, %d UI binaries rewritten, %d missing (%s)",
-             rewriteCount, uiRewriteCount, missingCount, basePath.c_str());
+    fclose(f);
+
+    // Find lv2:binary <soname.so> and replace it with an absolute path
+    size_t binaryPos = content.find("lv2:binary");
+    if (binaryPos == std::string::npos) return;
+
+    size_t lt = content.find('<', binaryPos);
+    size_t gt = content.find('>', lt != std::string::npos ? lt : 0);
+    if (lt == std::string::npos || gt == std::string::npos) return;
+
+    std::string binaryUri = content.substr(lt + 1, gt - lt - 1);
+    size_t lastSlash = binaryUri.rfind('/');
+    std::string soName = (lastSlash != std::string::npos)
+        ? binaryUri.substr(lastSlash + 1) : binaryUri;
+
+    if (soName.size() <= 3 || soName.substr(soName.size() - 3) != ".so") return;
+
+    std::string nativeLibPath = nativeLibDir_ + "/lib" + soName;
+    std::string pluginLibPath = pluginLibDir_.empty() ? std::string() : (pluginLibDir_ + "/lib" + soName);
+    std::string bundleSoPath = bundleDir + "/" + soName;
+
+    // Resolve which path to use for lv2:binary.
+    // Search order: nativeLibDir (full flavor) → pluginLibDir (PAD extraction) → bundle fallback
+    std::string binaryUriValue;
+    bool haveInLibDir = (access(nativeLibPath.c_str(), F_OK) == 0);
+    bool haveInPluginDir = (!pluginLibPath.empty() && access(pluginLibPath.c_str(), F_OK) == 0);
+    bool haveInBundle = (access(bundleSoPath.c_str(), F_OK) == 0);
+
+    if (haveInLibDir) {
+        binaryUriValue = "file://" + nativeLibPath;
+    } else if (haveInPluginDir) {
+        binaryUriValue = "file://" + pluginLibPath;
+    } else if (haveInBundle) {
+        binaryUriValue = "file://" + bundleSoPath;
+    } else {
+        LOGI("rewriteBundleManifest: no binary for %s in %s", soName.c_str(), bundleDir.c_str());
+        return;
     }
+
+    // Replace ALL occurrences of <soname.so> (multi-plugin bundles share the same binary)
+    std::string oldToken = "<" + binaryUri + ">";
+    std::string newToken = "<" + binaryUriValue + ">";
+    std::string newContent = content;
+    size_t pos = 0;
+    while ((pos = newContent.find(oldToken, pos)) != std::string::npos) {
+        newContent.replace(pos, oldToken.size(), newToken);
+        pos += newToken.size();
+    }
+
+    if (newContent == content) {
+        return;
+    }
+
+    FILE* fw = fopen(manifestPath.c_str(), "w");
+    if (!fw) {
+        LOGE("Failed to rewrite manifest: %s: %s", manifestPath.c_str(), strerror(errno));
+        return;
+    }
+    fwrite(newContent.c_str(), 1, newContent.size(), fw);
+    fclose(fw);
+
+    // Also rewrite guiext:binary in all .ttl files in this bundle
+    const int uiRewriteCount = rewriteGuiextBinaryPaths(bundleDir);
+    LOGI("rewriteBundleManifest: manifest rewritten, %d UI binaries rewritten (%s)",
+         uiRewriteCount, bundleDir.c_str());
 }
 
 #else // HAVE_LV2 not defined or == 0 - stub implementation
@@ -472,12 +481,12 @@ std::unique_ptr<IPlugin> LV2PluginFactory::createPlugin(const std::string& plugi
     return nullptr;
 }
 
-void LV2PluginFactory::scanPlugins(const std::string& bundlePath) {
-    // Stub
-}
-
-void LV2PluginFactory::rewriteManifestPaths(const std::string& basePath) {
-    // Stub
+bool LV2PluginFactory::refresh() {
+    // Stub: nothing can be loaded, but the symbol has to exist — the declaration
+    // lives outside the HAVE_LV2 block (IPluginFactory::refresh is part of the
+    // interface), so without this definition every stub link fails with an
+    // undefined reference.
+    return initialize();
 }
 
 #endif // HAVE_LV2 == 1

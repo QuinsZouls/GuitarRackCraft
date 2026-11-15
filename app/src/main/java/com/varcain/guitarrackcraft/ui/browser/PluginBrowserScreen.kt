@@ -20,6 +20,9 @@
 package com.varcain.guitarrackcraft.ui.browser
 
 import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
@@ -32,8 +35,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.Star
@@ -45,6 +50,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +66,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.activity.compose.BackHandler
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.varcain.guitarrackcraft.BuildConfig
+import com.varcain.guitarrackcraft.engine.Lv2BundleEntry
 import com.varcain.guitarrackcraft.engine.PluginInfo
 import com.varcain.guitarrackcraft.engine.UiType
 import kotlinx.coroutines.Dispatchers
@@ -80,6 +89,20 @@ fun PluginBrowserScreen(
     val addFailureMessage by viewModel.addFailureMessage.collectAsState()
     val favorites by viewModel.favorites.collectAsState()
     val blockingOperation by viewModel.blockingOperation.collectAsState()
+    val importState by viewModel.importState.collectAsState()
+    val importedBundles by viewModel.importedBundles.collectAsState()
+
+    val importEnabled = BuildConfig.LV2_IMPORT_ENABLED
+    val importRunning = importState is Lv2ImportState.Running
+    var importMenuOpen by remember { mutableStateOf(false) }
+    var showManageImported by remember { mutableStateOf(false) }
+
+    val zipPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) viewModel.importZip(uri)
+    }
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        if (uri != null) viewModel.importTree(uri)
+    }
 
     // Scope for kicking off add/replace plugin operations off the main thread.
     // VST activate (wine fork + guest_ready wait) blocks for several seconds.
@@ -104,6 +127,22 @@ fun PluginBrowserScreen(
         }
     }
 
+    // Import results are reported where the user is looking: the menu closes and
+    // the outcome arrives as a Snackbar.
+    LaunchedEffect(importState) {
+        when (val state = importState) {
+            is Lv2ImportState.Success -> {
+                snackbarHostState.showSnackbar(message = state.message, duration = SnackbarDuration.Long)
+                viewModel.consumeImportResult()
+            }
+            is Lv2ImportState.Error -> {
+                snackbarHostState.showSnackbar(message = state.message, duration = SnackbarDuration.Long)
+                viewModel.consumeImportResult()
+            }
+            is Lv2ImportState.Running, Lv2ImportState.Idle -> Unit
+        }
+    }
+
     BackHandler(enabled = blockingOperation != null) { }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -118,8 +157,44 @@ fun PluginBrowserScreen(
                         }
                     },
                     actions = {
-                        IconButton(onClick = { viewModel.refresh() }) {
+                        IconButton(onClick = { viewModel.refresh() }, enabled = !importRunning) {
                             Icon(Icons.Default.Refresh, contentDescription = "Refresh")
+                        }
+                        if (importEnabled) {
+                            Box {
+                                IconButton(
+                                    onClick = { importMenuOpen = true },
+                                    enabled = !importRunning
+                                ) {
+                                    Icon(Icons.Default.MoreVert, contentDescription = "More options")
+                                }
+                                DropdownMenu(
+                                    expanded = importMenuOpen,
+                                    onDismissRequest = { importMenuOpen = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("Import LV2 (ZIP)") },
+                                        onClick = {
+                                            importMenuOpen = false
+                                            zipPicker.launch(arrayOf("*/*"))
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Import LV2 (folder)") },
+                                        onClick = {
+                                            importMenuOpen = false
+                                            folderPicker.launch(null)
+                                        }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Manage imported (${importedBundles.size})") },
+                                        onClick = {
+                                            importMenuOpen = false
+                                            showManageImported = true
+                                        }
+                                    )
+                                }
+                            }
                         }
                     }
                 )
@@ -163,6 +238,13 @@ fun PluginBrowserScreen(
                             verticalArrangement = Arrangement.Center
                         ) {
                             Text("No plugins available")
+                            if (importEnabled) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "You can import your own LV2 bundles with the menu in the top bar.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 text = "LV2 plugins are loaded from the app's extracted assets (assets/lv2). This app ships with GxPlugins in assets—if you see nothing here, the native build may be using the LV2 stub (no lilv/serd/sord). Build the LV2 libraries and place them in app/src/main/cpp/libs/lv2/, then rebuild the app. See LV2_INTEGRATION.md.",
@@ -245,6 +327,91 @@ fun PluginBrowserScreen(
         blockingOperation?.let { label ->
             BrowserBlockingOperationOverlay(label = label)
         }
+        val runningImport = importState as? Lv2ImportState.Running
+        if (blockingOperation == null && runningImport != null) {
+            BrowserBlockingOperationOverlay(label = runningImport.label)
+        }
+    }
+
+    if (importEnabled && showManageImported) {
+        ManageImportedDialog(
+            entries = importedBundles,
+            onDelete = { viewModel.removeImported(it) },
+            onDismiss = { showManageImported = false }
+        )
+    }
+}
+
+/**
+ * "Manage imported" — the user-imported LV2 bundles currently in `filesDir/lv2_user`.
+ * Deleting only removes the files and tombstones the entry; the native world keeps
+ * the plugin until the engine restarts (lilv cannot unload a bundle in place).
+ */
+@Composable
+private fun ManageImportedDialog(
+    entries: List<Lv2BundleEntry>,
+    onDelete: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var pendingDelete by remember { mutableStateOf<Lv2BundleEntry?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Imported LV2 bundles") },
+        text = {
+            if (entries.isEmpty()) {
+                Text("Nothing imported yet. Use Import LV2 (ZIP) or Import LV2 (folder).")
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    items(entries, key = { it.id }) { entry ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = entry.displayName.ifEmpty { entry.id },
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                                Text(
+                                    text = "${entry.uris.size} plugin(s)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(onClick = { pendingDelete = entry }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete ${entry.displayName}")
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+
+    pendingDelete?.let { entry ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Delete ${entry.displayName.ifEmpty { entry.id }}?") },
+            text = {
+                Text(
+                    "The bundle's files are deleted now and its plugins disappear from this " +
+                        "list. The native plugin world only drops them when the engine restarts."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDelete = null
+                    onDelete(entry.id)
+                }) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -383,26 +550,51 @@ fun CategoryHeader(
     }
 }
 
+/**
+ * Decodes a plugin thumbnail. Shipped plugins keep theirs in `assets/lv2/`;
+ * an imported bundle is a directory on disk, so the same relative name is tried
+ * as an absolute path and under the plugin's modgui base path before giving up.
+ */
+private fun decodeThumbnail(
+    context: android.content.Context,
+    thumbnailPath: String,
+    modguiBasePath: String
+): androidx.compose.ui.graphics.ImageBitmap? {
+    if (thumbnailPath.isEmpty()) return null
+
+    runCatching {
+        context.assets.open("lv2/$thumbnailPath").use { inputStream ->
+            BitmapFactory.decodeStream(inputStream)?.asImageBitmap()
+        }
+    }.getOrNull()?.let { return it }
+
+    val candidates = buildList {
+        if (thumbnailPath.startsWith("/")) add(java.io.File(thumbnailPath))
+        if (modguiBasePath.isNotEmpty()) add(java.io.File(modguiBasePath, thumbnailPath))
+    }
+    for (candidate in candidates) {
+        if (!candidate.isFile) continue
+        runCatching { BitmapFactory.decodeFile(candidate.absolutePath)?.asImageBitmap() }
+            .getOrNull()?.let { return it }
+    }
+    return null
+}
+
 @Composable
 fun PluginThumbnail(
     thumbnailPath: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    modguiBasePath: String = ""
 ) {
     val context = LocalContext.current
     
-    val bitmap = produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, thumbnailPath) {
+    val bitmap = produceState<androidx.compose.ui.graphics.ImageBitmap?>(
+        initialValue = null,
+        thumbnailPath,
+        modguiBasePath
+    ) {
         value = withContext(Dispatchers.IO) {
-            try {
-                if (thumbnailPath.isNotEmpty()) {
-                    context.assets.open("lv2/$thumbnailPath").use { inputStream ->
-                        BitmapFactory.decodeStream(inputStream)?.asImageBitmap()
-                    }
-                } else {
-                    null
-                }
-            } catch (e: Exception) {
-                null
-            }
+            decodeThumbnail(context, thumbnailPath, modguiBasePath)
         }
     }
     
@@ -458,6 +650,7 @@ fun PluginItem(
             // Thumbnail
             PluginThumbnail(
                 thumbnailPath = plugin.thumbnailPath,
+                modguiBasePath = plugin.modguiBasePath,
                 modifier = Modifier
                     .size(80.dp)
             )

@@ -20,6 +20,7 @@
 #include "PluginUIManager.h"
 #include "PluginChain.h"
 #include "PluginUIGuard.h"
+#include "lv2/LV2WorldLock.h"
 #include "../x11/X11Worker.h"
 #include "../x11/X11NativeDisplay.h"
 #include <android/log.h>
@@ -54,7 +55,16 @@ bool PluginUIManager::createPluginUI(int pluginIndex, int displayNumber,
         return false;
     }
 
-    PluginInfo info = plugin->getInfo();
+    PluginInfo info;
+    {
+        // getInfo() reads the plugin's nodes in the shared LilvWorld, so it runs
+        // under the world lock (an import writes that world). Released before the
+        // postTaskAndWait() below on purpose: the pluginUI thread takes the same
+        // lock while it instantiates the UI, and holding it across that hand-off
+        // would deadlock.
+        lv2world::Guard worldLock = lv2world::guard();
+        info = plugin->getInfo();
+    }
 
     if (!info.hasX11Ui || info.x11UiBinaryPath.empty()) {
         LOGI("createPluginUI: plugin %d has no X11 UI", pluginIndex);

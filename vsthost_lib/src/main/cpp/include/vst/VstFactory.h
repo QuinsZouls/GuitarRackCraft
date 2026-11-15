@@ -61,7 +61,7 @@ public:
     std::unique_ptr<guitarrackcraft::IPlugin> createPlugin(const std::string& pluginId) override;
 
     /** Re-read registry.json. Called after Manage VST import/remove. */
-    void refresh();
+    bool refresh() override;
 
 private:
     bool loadRegistry();

@@ -14,6 +14,17 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# ThreadSanitizer for the host tests. Off by default: the graded build uses a
+# plain Debug configuration, the race detectors are opt-in runs.
+#   cmake -S tests -B build/host-tests-tsan -DCMAKE_BUILD_TYPE=Debug -DGRC_HOST_TSAN=ON
+#   cmake --build build/host-tests-tsan -j8 && ctest --test-dir build/host-tests-tsan
+option(GRC_HOST_TSAN "Build the host tests with ThreadSanitizer" OFF)
+if(GRC_HOST_TSAN)
+    add_compile_options(-fsanitize=thread -g -O1)
+    add_link_options(-fsanitize=thread)
+    message(STATUS "Host tests: ThreadSanitizer ENABLED")
+endif()
+
 # Source directory for X11 modules
 set(X11_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp/x11)
 set(CPP_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/cpp)
@@ -212,4 +223,205 @@ if(TARGET lv2_atom_unit_tests)
 endif()
 if(TARGET dsp_unit_tests)
     gtest_discover_tests(dsp_unit_tests)
+endif()
+# ---------------------------------------------------------------------------
+# Plugin registry refresh (no Android, no lilv): pins the contract behind
+# nativeRefreshPluginRegistry — refreshAll() must reach IPluginFactory::refresh()
+# and rebuild the "FORMAT:id" cache.
+# ---------------------------------------------------------------------------
+add_executable(plugin_registry_unit_tests
+    plugin/TestPluginRegistryRefresh.cpp
+    ${CPP_SRC_DIR}/plugin/PluginRegistry.cpp
+)
+target_link_libraries(plugin_registry_unit_tests PRIVATE gtest_main)
+target_include_directories(plugin_registry_unit_tests PRIVATE ${CPP_SRC_DIR})
+gtest_discover_tests(plugin_registry_unit_tests)
+
+# ---------------------------------------------------------------------------
+# Lock protocol of the rescan path (no Android, no lilv). refreshAll() and
+# initializeAll() mutate the shared LilvWorld, so they must hold the process-wide
+# world lock for their whole duration, or an import corrupts the world under the
+# JNI entry points that instantiate plugins and read their info.
+# ---------------------------------------------------------------------------
+add_executable(plugin_world_lock_tests
+    plugin/TestPluginRegistryWorldLock.cpp
+    ${CPP_SRC_DIR}/plugin/PluginRegistry.cpp
+)
+target_link_libraries(plugin_world_lock_tests PRIVATE gtest_main pthread)
+target_include_directories(plugin_world_lock_tests PRIVATE ${CPP_SRC_DIR})
+gtest_discover_tests(plugin_world_lock_tests)
+
+# ---------------------------------------------------------------------------
+# LV2 incremental rescan against the real lilv stack.
+#
+# The repo's LV2 archives are aarch64 only, so the host build compiles the
+# checked-out sources of serd/sord/sratom/zix/lilv directly: plain C, no meson,
+# no generated file beyond lilv_config.h (tests/lv2/lilv_config.h) and the
+# abstract_io layer lilv's Android fork redirects through
+# (tests/lv2/abstract_io_posix.c). Skipped, never failed, on a bare checkout.
+# ---------------------------------------------------------------------------
+enable_language(C)
+
+set(LV2_3P_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party)
+set(LV2_HOST_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lv2)
+set(LV2_HOST_READY ON)
+foreach(required
+    serd/src/env.c
+    sord/src/sord.c
+    sratom/src/sratom.c
+    zix/src/btree.c
+    lilv/src/world.c
+    lv2/include/lv2/core/lv2.h)
+    if(NOT EXISTS ${LV2_3P_DIR}/${required})
+        set(LV2_HOST_READY OFF)
+    endif()
+endforeach()
+
+if(LV2_HOST_READY)
+    add_library(lv2host_serd STATIC
+        ${LV2_3P_DIR}/serd/src/base64.c
+        ${LV2_3P_DIR}/serd/src/byte_source.c
+        ${LV2_3P_DIR}/serd/src/env.c
+        ${LV2_3P_DIR}/serd/src/n3.c
+        ${LV2_3P_DIR}/serd/src/node.c
+        ${LV2_3P_DIR}/serd/src/read_utf8.c
+        ${LV2_3P_DIR}/serd/src/reader.c
+        ${LV2_3P_DIR}/serd/src/string.c
+        ${LV2_3P_DIR}/serd/src/system.c
+        ${LV2_3P_DIR}/serd/src/uri.c
+        ${LV2_3P_DIR}/serd/src/writer.c
+    )
+    target_include_directories(lv2host_serd PUBLIC
+        ${LV2_3P_DIR}/serd/include
+        ${LV2_3P_DIR}/serd/src
+    )
+
+    add_library(lv2host_zix STATIC
+        ${LV2_3P_DIR}/zix/src/allocator.c
+        ${LV2_3P_DIR}/zix/src/btree.c
+        ${LV2_3P_DIR}/zix/src/bump_allocator.c
+        ${LV2_3P_DIR}/zix/src/digest.c
+        ${LV2_3P_DIR}/zix/src/errno_status.c
+        ${LV2_3P_DIR}/zix/src/hash.c
+        ${LV2_3P_DIR}/zix/src/status.c
+        ${LV2_3P_DIR}/zix/src/string_view.c
+    )
+    target_include_directories(lv2host_zix PUBLIC ${LV2_3P_DIR}/zix/include)
+
+    add_library(lv2host_sord STATIC
+        ${LV2_3P_DIR}/sord/src/sord.c
+        ${LV2_3P_DIR}/sord/src/syntax.c
+    )
+    target_include_directories(lv2host_sord PUBLIC
+        ${LV2_3P_DIR}/sord/include
+        ${LV2_3P_DIR}/sord/src
+    )
+    target_link_libraries(lv2host_sord PUBLIC lv2host_serd lv2host_zix)
+
+    add_library(lv2host_sratom STATIC
+        ${LV2_3P_DIR}/sratom/src/sratom.c
+    )
+    target_include_directories(lv2host_sratom PUBLIC
+        ${LV2_3P_DIR}/sratom/include
+        ${LV2_3P_DIR}/lv2/include
+    )
+    target_link_libraries(lv2host_sratom PUBLIC lv2host_sord lv2host_serd)
+
+    add_library(lv2host_lilv STATIC
+        ${LV2_3P_DIR}/lilv/src/collections.c
+        ${LV2_3P_DIR}/lilv/src/filesystem.c
+        ${LV2_3P_DIR}/lilv/src/instance.c
+        ${LV2_3P_DIR}/lilv/src/lib.c
+        ${LV2_3P_DIR}/lilv/src/node.c
+        ${LV2_3P_DIR}/lilv/src/plugin.c
+        ${LV2_3P_DIR}/lilv/src/pluginclass.c
+        ${LV2_3P_DIR}/lilv/src/port.c
+        ${LV2_3P_DIR}/lilv/src/query.c
+        ${LV2_3P_DIR}/lilv/src/scalepoint.c
+        ${LV2_3P_DIR}/lilv/src/state.c
+        ${LV2_3P_DIR}/lilv/src/ui.c
+        ${LV2_3P_DIR}/lilv/src/util.c
+        ${LV2_3P_DIR}/lilv/src/world.c
+        ${LV2_3P_DIR}/lilv/src/zix/tree.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/lv2/abstract_io_posix.c
+    )
+    # The vendored lilv sources are compiled below lilv's own I/O redirection
+    # macros, so they need the abstract layer of the fork, provided by
+    # abstract_io_posix.c above; LILV_INTERNAL is what its static build uses.
+    target_compile_definitions(lv2host_lilv PRIVATE LILV_INTERNAL=1)
+    target_include_directories(lv2host_lilv PUBLIC
+        ${LV2_HOST_CONFIG_DIR}
+        ${LV2_3P_DIR}/lilv
+        ${LV2_3P_DIR}/lilv/src
+        ${LV2_3P_DIR}/lv2/include
+    )
+    target_link_libraries(lv2host_lilv PUBLIC lv2host_sord lv2host_sratom lv2host_serd)
+    set_target_properties(lv2host_lilv PROPERTIES C_STANDARD 99)
+
+    add_library(lv2_test_plugin MODULE lv2/TestPluginBinary.c)
+    target_include_directories(lv2_test_plugin PRIVATE ${LV2_3P_DIR}/lv2/include)
+    set_target_properties(lv2_test_plugin PROPERTIES PREFIX "" OUTPUT_NAME "lv2testplugin")
+
+    add_executable(lv2_rescan_tests
+        lv2/TestLV2BundleScanner.cpp
+        ${CPP_SRC_DIR}/plugin/lv2/LV2BundleScanner.cpp
+    )
+    target_compile_definitions(lv2_rescan_tests PRIVATE
+        HAVE_LV2=1
+        "GRC_LV2_TEST_PLUGIN=\"$<TARGET_FILE:lv2_test_plugin>\""
+    )
+    target_include_directories(lv2_rescan_tests PRIVATE ${CPP_SRC_DIR})
+    target_link_libraries(lv2_rescan_tests PRIVATE gtest_main lv2host_lilv ${CMAKE_DL_LIBS})
+    add_dependencies(lv2_rescan_tests lv2_test_plugin)
+    gtest_discover_tests(lv2_rescan_tests)
+
+    # The plugin -> bundle mapping the importer relies on: `PluginInfo.bundlePath`
+    # is what `Lv2BundleAttribution` uses to decide which imported bundle a plugin
+    # came from, and nothing asserted that the factory fills it in. This target
+    # compiles the REAL factory against the vendored lilv, plus the two
+    # translation units it references (LV2Plugin, and PluginUIGuard which
+    # LV2Plugin's destructor calls); the only Android headers those files include
+    # are logging and asset-manager declarations that the host paths never reach,
+    # so lv2/stubs/ stands in for them.
+    add_executable(lv2_factory_bundle_path_tests
+        lv2/TestLV2PluginFactoryBundlePath.cpp
+        ${CPP_SRC_DIR}/plugin/lv2/LV2PluginFactory.cpp
+        ${CPP_SRC_DIR}/plugin/lv2/LV2Plugin.cpp
+        ${CPP_SRC_DIR}/plugin/lv2/LV2BundleScanner.cpp
+        ${CPP_SRC_DIR}/plugin/lv2/LV2Utils.cpp
+        ${CPP_SRC_DIR}/plugin/PluginUIGuard.cpp
+    )
+    target_compile_definitions(lv2_factory_bundle_path_tests PRIVATE
+        HAVE_LV2=1
+        "GRC_LV2_TEST_PLUGIN=\"$<TARGET_FILE:lv2_test_plugin>\""
+    )
+    target_include_directories(lv2_factory_bundle_path_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/lv2/stubs
+        ${CPP_SRC_DIR}
+    )
+    target_link_libraries(lv2_factory_bundle_path_tests PRIVATE
+        gtest_main lv2host_lilv ${CMAKE_DL_LIBS} pthread)
+    add_dependencies(lv2_factory_bundle_path_tests lv2_test_plugin)
+    gtest_discover_tests(lv2_factory_bundle_path_tests)
+
+    # The race the world lock closes, against the real lilv/sord: an import
+    # (lilv_world_load_bundle + specifications + classes) while the rack
+    # instantiates plugins and reads their info from the same world. Run under
+    # -DGRC_HOST_TSAN=ON it is the race detector for lilv's model itself.
+    add_executable(lv2_world_lock_tests
+        lv2/TestLV2WorldLock.cpp
+    )
+    target_compile_definitions(lv2_world_lock_tests PRIVATE
+        "GRC_LV2_TEST_PLUGIN=\"$<TARGET_FILE:lv2_test_plugin>\""
+    )
+    target_include_directories(lv2_world_lock_tests PRIVATE ${CPP_SRC_DIR})
+    target_link_libraries(lv2_world_lock_tests PRIVATE
+        gtest_main lv2host_lilv ${CMAKE_DL_LIBS} pthread)
+    add_dependencies(lv2_world_lock_tests lv2_test_plugin)
+    gtest_discover_tests(lv2_world_lock_tests)
+
+    message(STATUS "LV2 rescan tests: ENABLED (host lilv built from 3rd_party)")
+else()
+    message(WARNING "LV2 rescan tests: DISABLED (3rd_party/{serd,sord,sratom,zix,lilv,lv2} "
+                    "are not checked out)")
 endif()

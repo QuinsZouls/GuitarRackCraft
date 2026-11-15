@@ -125,6 +125,9 @@ android {
             targetSdk = 28
             buildConfigField("boolean", "USE_ASSET_PACKS", "false")
             buildConfigField("boolean", "HAS_VST_HOST",   "true")
+            // Importing user LV2 bundles needs to dlopen a .so from filesDir,
+            // which only targetSdk 28 still allows (see targetSdk above).
+            buildConfigField("boolean", "LV2_IMPORT_ENABLED", "true")
             externalNativeBuild {
                 cmake {
                     // Toggle the VstFactory registration block in
@@ -141,6 +144,9 @@ android {
             targetSdk = 35
             buildConfigField("boolean", "USE_ASSET_PACKS", "true")
             buildConfigField("boolean", "HAS_VST_HOST",   "false")
+            // W^X at targetSdk 35: a plugin .so living in filesDir cannot be
+            // loaded, so the LV2 importer stays off here.
+            buildConfigField("boolean", "LV2_IMPORT_ENABLED", "false")
         }
     }
 

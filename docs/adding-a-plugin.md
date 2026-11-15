@@ -139,3 +139,184 @@ These fail loudly instead of shipping a broken plugin:
   manifest's `lv2:binary <x.so>` at `lib<x.so>` in the app's native library
   dir (`full`), or in the directory the asset packs were extracted to
   (`playstore`).
+
+## Importing a plugin at runtime (full flavor)
+
+A user can install an LV2 bundle on the device without rebuilding the app. This
+is the `full` flavor only (`BuildConfig.LV2_IMPORT_ENABLED`): it needs to
+`dlopen` a library from `filesDir`, which `targetSdk` 28 still allows and
+`playstore`'s `targetSdk` 35 forbids (W^X).
+
+The browser's overflow menu offers **Import LV2 (ZIP)**, **Import LV2 (folder)**
+and **Manage imported**. Imported bundles are copied to
+`filesDir/lv2_user/<uuid>/` (never executed from the SAF location), recorded in
+`filesDir/lv2_user/registry.json` (written to a staging file and renamed over
+the old one, so a crash mid-import cannot truncate the bookkeeping), and loaded
+by the LV2 factory, which scans `filesDir/lv2_user` in addition to the extracted
+assets. No restart is needed:
+`nativeRefreshPluginRegistry()` → `PluginRegistry::refreshAll()` →
+`LV2PluginFactory::refresh()` loads only the bundles it has not seen yet into
+the existing `LilvWorld` (a live plugin holds pointers into it, so the world is
+never rebuilt).
+
+What the importer refuses before the engine ever sees the files
+(`Lv2BundleImporter`):
+
+- no `manifest.ttl` anywhere in the tree, or no `.so`;
+- any `.so` that is not ELF64 little-endian AArch64 (a plugin built for x86-64
+  or ARM32 fails on `dlopen` with a far worse message);
+- paths that escape the destination directory (`..`, absolute), more than 4096
+  files, or more than 512 MB unpacked.
+
+Plugin binaries are made read-only after the copy. A ZIP whose `manifest.ttl`
+sits at the archive root is wrapped in `<picked name>.lv2/`.
+
+The copy is staged: it lands in `lv2_user/.staging-<uuid>/` and is only renamed
+to `lv2_user/<uuid>/` once validation passes, so a failed import leaves nothing
+behind. The native scanner skips every dot directory, not just `.` and `..`, so a
+bundle that is still being copied — or one the importer is about to roll back —
+is never loaded into the `LilvWorld` (`tests/lv2/TestLV2BundleScanner.cpp`,
+`SkipsStagingDirectoriesOfInFlightImports`).
+
+Known limits, by design:
+
+- Deleting an imported bundle deletes its files and marks its registry entry
+  `removed`. The URI stays in the browser list filter and in the `LilvWorld`
+  until the process restarts; lilv cannot unload a single bundle safely.
+- `ui:binary`/`guiext:binary` inside an imported bundle is rewritten to an
+  absolute path inside the bundle when it is not in the app's native library
+  directory, so bundled UIs keep working.
+
+### Which bundle a plugin came from
+
+The engine reports `PluginInfo.bundlePath` for every LV2 plugin: the absolute
+directory lilv loaded it from (the same thing `lilv_plugin_get_bundle_uri()`
+returns, without the trailing slash). `modguiBasePath` is **not** usable for
+this: it is only set for bundles that ship a `modgui.ttl` with an
+`iconTemplate` (`LV2Utils.cpp`).
+
+`Lv2BundleAttribution` uses that path to map a plugin URI back to the entry in
+`registry.json`: a plugin belongs to bundle `id` when its bundle lives at
+`filesDir/lv2_user/<id>` or below (a plain `<id>/Foo.lv2/`, or the wrapped
+directory of a bare bundle). The browser reconciles that mapping on every
+enumeration (`Lv2BundleRegistry.reconcileUris`), so a bundle imported while the
+engine was not enumerating is attributed on the next refresh instead of keeping
+an empty URI list forever. The "URIs that appeared during the rescan" diff is
+only kept as a fallback message at import time.
+
+The path travels through the whole native chain (lilv bundle URI →
+`pluginBundlePath()` → `PluginInfo` → JNI → `PluginInfo.kt`) with nothing to
+enforce it at the far end: an empty `bundlePath` does not fail, it silently
+un-attributes every imported plugin. `tests/lv2/TestLV2PluginFactoryBundlePath.cpp`
+therefore drives the real `LV2PluginFactory` against the vendored lilv and asserts
+the reported path (the Android headers that translation unit includes are stubbed
+under `tests/lv2/stubs/`, which is all the host build needs).
+
+### Threading: the shared LilvWorld has one lock
+
+Importing while the rack is running means loading new bundles into a world that
+live plugins and the browser are reading. lilv/sord have no thread safety at
+all, and there is no read-only call in them:
+
+- `lilv_world_load_bundle()` inserts into `world->model` (the writer);
+- `lilv_new_uri()` — used by `getInfo()` for every port class and by
+  `lilv_plugin_instantiate()` for `rdf:type` — interns the URI in the sord world
+  (`lilv/src/node.c:69`, `sord_new_uri` → hash insert);
+- `lilv_plugin_instantiate()` runs `lilv_plugin_load_if_necessary()` and
+  `lilv_lib_open()`, which looks the `.so` handle up in `world->libs` and bumps
+  its refcount, inserting it on first use (`lilv/src/lib.c:48-50` and `:124`).
+
+So a read/write lock with shared readers would still let two concurrent plugin
+creations race on the same intern trees. Everything that touches the world
+serializes on one mutex, `guitarrackcraft::lv2world::lock()`
+(`app/src/main/cpp/plugin/lv2/LV2WorldLock.h`), and the lock order is:
+
+1. `lv2world::lock()`;
+2. `PluginRegistry` cache mutex;
+3. `PluginChain` chain mutex.
+
+Covered by the lock: `PluginRegistry::initializeAll()`/`refreshAll()`,
+`nativeAddPluginToRack`, `nativeGetRackPluginInfo`, `nativeStartEngine`,
+`nativeProcessFile`, `nativeSaveChainState`, and the `getInfo()` calls of
+`PluginUIManager::createPluginUI()` and `LV2PluginUI::instantiate()` (the UI is
+instantiated on the display's pluginUI thread while the JNI thread waits, so the
+lock sits in each body, never around the hand-off).
+
+Not covered, on purpose: the audio callback (it only runs `lilv_instance_run`
+on instances already in the chain), `nativeStopEngine` and
+`nativeRestorePluginState` (instance-level calls only),
+`nativeGetAvailablePlugins` (reads the registry cache), and
+`nativeCreatePluginUI` itself (see above).
+
+#### The one uncovered writer: plugin teardown
+
+Removing a plugin from the rack is the remaining path that mutates the world
+without the lock. It is **pre-existing**, not introduced here: before this
+feature the world was written by `LV2PluginFactory::initialize()` (once, at
+startup, before anything else runs) and by this teardown path — which never
+needed a lock because `initialize()` had already finished. Importing bundles at
+runtime adds a *third* writer, and that is what makes the two collide. The path
+is
+
+```
+nativeRemovePluginFromRack        jni/NativeBridge.cpp:716-730
+  └─ PluginChain::removePlugin    plugin/PluginChain.cpp:99-117
+      └─ enqueueTeardown          plugin/PluginChain.cpp:119-137
+          └─ teardownLoop         plugin/PluginChain.cpp:139-165
+              └─ ~LV2Plugin       plugin/lv2/LV2Plugin.cpp:228-237
+                  └─ lilv_instance_free   lilv/src/instance.c:113-124
+                      └─ lilv_lib_close  lilv/src/lib.c:140-154
+```
+
+`removePlugin()` detaches the instance from the chain and hands the object to a
+dedicated teardown thread, which drops it (the local `std::unique_ptr` in
+`teardownLoop`, `PluginChain.cpp:142`, dies at the end of the iteration,
+`PluginChain.cpp:163`). The destruction therefore happens on that thread, and
+`lilv_instance_free()` ends in `lilv_lib_close()`, which **writes** `world->libs`
+when the last reference goes away: `--lib->refs`, then `zix_tree_remove()` on the
+world's library tree, `lilv_node_free(lib->uri)` and a plain `free(lib)`
+(`lilv/src/lib.c:142-153`). No lock is held there.
+
+That races the same structures the lock protects: a concurrent
+`refreshAll()`/`LV2PluginFactory::refresh()` loading a bundle
+(`zix_tree_insert()` into `world->libs`) or a concurrent `nativeAddPluginToRack`
+opening the same library (`lilv_lib_open()`, which inserts or bumps the refcount
+in the same tree) can walk a tree that the teardown thread is removing a node
+from. The window is narrow and needs an import or an add *while* a plugin is
+being removed — the rack UI makes that possible (delete a plugin, then confirm
+the import dialog).
+
+The feature narrows it but cannot close it. Plugin *creation* and every rescan
+now serialize on `lv2world::lock()`, so the two writers that remain are creation
+(matched) and teardown (unmatched). Closing it needs a lock around
+`lilv_instance_free()` in `~LV2Plugin` (`LV2Plugin.cpp:233`) — the destructor
+runs on the teardown thread, never in the audio callback, so that acquisition
+cannot enter the real-time path and does not change latency behaviour. That edit
+belongs to the plugin/chain layer (`LV2Plugin.cpp`, plus `PluginChain.cpp` if the
+teardown ordering is to be asserted), not to this feature:
+**follow-up, tracked as "hold `lv2world::lock()` around `lilv_instance_free()` in
+the teardown path"**. `LV2Plugin::deactivate()`'s re-instantiation path
+(`LV2Plugin.cpp:282`) frees the previous instance the same unlocked way and would
+want the same treatment.
+
+Tests: `tests/plugin/TestPluginRegistryWorldLock.cpp` pins that a rebuild holds
+the lock for its whole duration and waits for the JNI paths, and
+`tests/lv2/TestLV2WorldLock.cpp` runs a real import against a real plugin
+creation. Built with `-DGRC_HOST_TSAN=ON` the latter is the race detector for
+lilv itself: without the lock TSan reports a data race in
+`lilv_lib_open()` (`lilv/src/lib.c`) between the importing thread inserting the
+`.so` into `world->libs` and the creating thread walking the same table — both
+tests are TSan-clean with the lock.
+
+Known leak, accepted: `LV2PluginFactory::refresh()` re-runs
+`loadSpecificationsAndClasses()` whenever it loaded a new bundle, and
+`lilv_world_load_plugin_classes()` re-parses every LV2 plugin class into the
+world without freeing the previous copy: for each class it mallocs a fresh
+`LilvPluginClass` and inserts it into `world->plugin_classes`
+(`lilv/src/world.c:1037`), and on a repeat run the tree rejects the duplicate
+(`lilv/src/pluginclass.c:27` never looks at the tree first) — so the class and
+its three nodes are orphaned. The leak is bounded by "number of plugin classes ×
+number of imports that loaded something" — kilobytes per import, independent of
+the bundle's size — and it is not fixable from this repository: lilv is a
+prebuilt library here (no meson in the build) and the only alternative,
+recreating the world, would invalidate every live `LV2Plugin`.

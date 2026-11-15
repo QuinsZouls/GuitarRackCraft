@@ -18,6 +18,7 @@
  */
 
 #include "LV2PluginUI.h"
+#include "LV2WorldLock.h"
 #include "../../x11/X11NativeDisplay.h"
 #include <android/log.h>
 #include <atomic>
@@ -575,7 +576,15 @@ bool LV2PluginUI::instantiate(
        bypass toggle is completely backwards. */
     IPlugin* pluginPtrForMap = plugin_.load(std::memory_order_acquire);
     if (pluginPtrForMap) {
-        PluginInfo mapInfo = pluginPtrForMap->getInfo();
+        // Instantiation runs on the display's pluginUI thread, not on the JNI
+        // thread that posted it: getInfo() reads the shared LilvWorld, so the
+        // world lock is taken here, in the body that performs the read
+        // (LV2WorldLock.h). The posting thread deliberately holds nothing.
+        PluginInfo mapInfo;
+        {
+            lv2world::Guard worldLock = lv2world::guard();
+            mapInfo = pluginPtrForMap->getInfo();
+        }
         portSymbolMap_.clear();
         for (const auto& port : mapInfo.ports) {
             if (!port.symbol.empty()) {
@@ -661,7 +670,11 @@ bool LV2PluginUI::instantiate(
     /* --- Send initial port values to the UI ---------------------- */
     IPlugin* pluginPtr = plugin_.load(std::memory_order_acquire);
     if (pluginPtr) {
-        PluginInfo info = pluginPtr->getInfo();
+        PluginInfo info;
+        {
+            lv2world::Guard worldLock = lv2world::guard();
+            info = pluginPtr->getInfo();
+        }
         int portEventCount = 0;
         for (const auto& port : info.ports) {
             if (port.isControl && !port.isAudio) {

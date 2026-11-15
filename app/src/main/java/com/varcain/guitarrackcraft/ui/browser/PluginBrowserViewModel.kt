@@ -21,11 +21,20 @@ package com.varcain.guitarrackcraft.ui.browser
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.varcain.guitarrackcraft.BuildConfig
 import com.varcain.guitarrackcraft.engine.FavoritesManager
+import com.varcain.guitarrackcraft.engine.Lv2BundleAttribution
+import com.varcain.guitarrackcraft.engine.Lv2BundleEntry
+import com.varcain.guitarrackcraft.engine.Lv2BundleImporter
+import com.varcain.guitarrackcraft.engine.Lv2BundleRegistry
+import com.varcain.guitarrackcraft.engine.Lv2SafSources
+import com.varcain.guitarrackcraft.engine.NativeEngine
 import com.varcain.guitarrackcraft.engine.PluginInfo
 import com.varcain.guitarrackcraft.engine.RackManager
+import com.varcain.guitarrackcraft.engine.ZipImportSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,6 +42,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
+import java.util.UUID
 
 /**
  * Category information for a plugin.
@@ -75,6 +86,7 @@ object PluginCategoryMapping {
     const val AUTHOR_BRUMMER10 = "brummer10"
     const val AUTHOR_UNKNOWN = "Unknown"
     const val AUTHOR_WINDOWS_VST = "Windows VST"
+    const val AUTHOR_IMPORTED_LV2 = "Imported LV2"
 
     /** Maps LV2 plugin class names to display categories. */
     private val LV2_CLASS_TO_CATEGORY = mapOf(
@@ -134,6 +146,17 @@ object PluginCategoryMapping {
     }
 }
 
+/**
+ * Progress/outcome of an LV2 bundle import, shown as Snackbar + disabled menu in
+ * the browser.
+ */
+sealed interface Lv2ImportState {
+    data object Idle : Lv2ImportState
+    data class Running(val label: String) : Lv2ImportState
+    data class Success(val message: String) : Lv2ImportState
+    data class Error(val message: String) : Lv2ImportState
+}
+
 class PluginBrowserViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
@@ -177,6 +200,24 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
     
     /** Set of plugin names that have working binaries */
     private var availablePlugins: Set<String> = emptySet()
+
+    /** Plugin URIs contributed by user-imported bundles; grouped under
+     *  [PluginCategoryMapping.AUTHOR_IMPORTED_LV2]. */
+    private var importedUris: Set<String> = emptySet()
+
+    /** Plugin URIs whose imported bundle was deleted. The native world keeps
+     *  reporting them until the process restarts, so they are filtered here. */
+    private var removedUris: Set<String> = emptySet()
+
+    private val _importState = MutableStateFlow<Lv2ImportState>(Lv2ImportState.Idle)
+    val importState: StateFlow<Lv2ImportState> = _importState.asStateFlow()
+
+    private val _importedBundles = MutableStateFlow<List<Lv2BundleEntry>>(emptyList())
+    val importedBundles: StateFlow<List<Lv2BundleEntry>> = _importedBundles.asStateFlow()
+
+    private val filesDir: File get() = appContext.filesDir
+
+    private val importEnabled: Boolean get() = BuildConfig.LV2_IMPORT_ENABLED
 
     init {
         _favorites.value = FavoritesManager.getFavorites(appContext)
@@ -258,12 +299,28 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
                 pluginMetadata = PluginMetadata(descriptions, thumbnails, authors, categories, vstArch)
                 availablePlugins = available
 
-                android.util.Log.i("PluginBrowser", "Loaded ${available.size} available plugins with binaries")
+                // Runtime overlay: user-imported LV2 bundles (full flavor) are not
+                // in the static metadata either. Same rule as for VSTs above — never
+                // append them to `available`, that would flip the native list into
+                // "show only listed" and hide every shipped LV2 plugin. Their URIs
+                // are only used to group them under "Imported LV2" and to hide
+                // plugins whose bundle was deleted.
+                importedUris = Lv2BundleRegistry.activeUris(filesDir)
+                removedUris = Lv2BundleRegistry.removedUris(filesDir)
+                _importedBundles.value = Lv2BundleRegistry.activeBundles(filesDir)
+
+                android.util.Log.i(
+                    "PluginBrowser",
+                    "Loaded ${available.size} available plugins with binaries, " +
+                        "${importedUris.size} imported LV2 URI(s)"
+                )
             }
         } catch (e: Exception) {
             android.util.Log.w("PluginBrowser", "Failed to load plugin metadata: ${e.message}")
             pluginMetadata = PluginMetadata(emptyMap(), emptyMap(), emptyMap(), emptyMap())
             availablePlugins = emptySet()
+            importedUris = emptySet()
+            removedUris = emptySet()
         }
     }
     
@@ -302,27 +359,25 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
         )
     }
 
-    private fun loadPlugins() {
-        viewModelScope.launch { loadPluginsInternal() }
-    }
-
     private suspend fun loadPluginsInternal() {
         _isLoading.value = true
         _errorMessage.value = null
 
         try {
             val allPlugins = RackManager.getAvailablePlugins()
+
+            // Attribute imported plugins to their bundle directory before the
+            // list is grouped: an import that happened while the engine was not
+            // enumerating leaves its entry without URIs, and those plugins would
+            // otherwise never be grouped under "Imported LV2" (nor hidden when
+            // the bundle is deleted).
+            reconcileImportedUris(allPlugins)
+
             val availablePluginNamesLower = availablePlugins.map { it.lowercase() }.toSet()
 
-            // If metadata lists specific available plugins, filter to only those.
-            // If the list is empty (no metadata), show all plugins from the native engine.
-            val filteredPlugins = if (availablePluginNamesLower.isEmpty()) {
-                allPlugins.map { applyMetadata(it) }
-            } else {
-                allPlugins.filter { plugin ->
-                    availablePluginNamesLower.contains(plugin.name.lowercase())
-                }.map { applyMetadata(it) }
-            }
+            val filteredPlugins = Lv2BundleAttribution
+                .visiblePlugins(allPlugins, availablePluginNamesLower, importedUris, removedUris)
+                .map { applyMetadata(it) }
 
             android.util.Log.i("PluginBrowser", "Showing ${filteredPlugins.size} out of ${allPlugins.size} discovered plugins (metadata filter=${availablePluginNamesLower.size})")
 
@@ -334,6 +389,21 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
             _isLoading.value = false
         }
     }
+
+    /** Re-derive which bundle each imported plugin belongs to and persist it.
+     *  Cheap and idempotent: [Lv2BundleRegistry.reconcileUris] only touches the
+     *  registry file when the attribution actually changed. */
+    private suspend fun reconcileImportedUris(plugins: List<PluginInfo>) {
+        val entries = withContext(Dispatchers.IO) {
+            Lv2BundleRegistry.reconcileUris(
+                filesDir,
+                Lv2BundleAttribution.urisByBundle(plugins, userDir()),
+            )
+        }
+        importedUris = Lv2BundleRegistry.activeUris(entries)
+        removedUris = Lv2BundleRegistry.removedUris(entries)
+        _importedBundles.value = Lv2BundleRegistry.activeBundles(entries)
+    }
     
     /**
      * Groups plugins first by author, then by category within each author.
@@ -341,10 +411,22 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
     private fun groupPluginsByAuthorAndCategory(plugins: List<PluginInfo>): List<AuthorGroup> {
         val metadataAuthors = pluginMetadata?.authors ?: emptyMap()
         val metadataCategories = pluginMetadata?.categories ?: emptyMap()
-        val byAuthor = plugins.groupBy { PluginCategoryMapping.getAuthor(it.name, it.format, metadataAuthors) }
+        val byAuthor = plugins.groupBy { plugin ->
+            if (isImported(plugin)) {
+                PluginCategoryMapping.AUTHOR_IMPORTED_LV2
+            } else {
+                PluginCategoryMapping.getAuthor(plugin.name, plugin.format, metadataAuthors)
+            }
+        }
 
         val authorGroups = byAuthor.map { (author, authorPlugins) ->
-            val byCategory = authorPlugins.groupBy { PluginCategoryMapping.getCategory(it.name, metadataCategories) }
+            val byCategory = authorPlugins.groupBy { plugin ->
+                if (isImported(plugin)) {
+                    PluginCategoryMapping.AUTHOR_IMPORTED_LV2
+                } else {
+                    PluginCategoryMapping.getCategory(plugin.name, metadataCategories)
+                }
+            }
 
             val sortedCategories = byCategory.toList()
                 .sortedBy { (category, _) ->
@@ -364,12 +446,13 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
         }.sortedBy {
             when (it.name) {
                 PluginCategoryMapping.AUTHOR_WINDOWS_VST -> 0
-                PluginCategoryMapping.AUTHOR_NEURAL_AMP -> 1
-                PluginCategoryMapping.AUTHOR_AIDA_DSP -> 2
-                PluginCategoryMapping.AUTHOR_GUITARIX -> 3
-                PluginCategoryMapping.AUTHOR_BRUMMER10 -> 4
-                PluginCategoryMapping.AUTHOR_GXPLUGINS -> 5
-                else -> 6
+                PluginCategoryMapping.AUTHOR_IMPORTED_LV2 -> 1
+                PluginCategoryMapping.AUTHOR_NEURAL_AMP -> 2
+                PluginCategoryMapping.AUTHOR_AIDA_DSP -> 3
+                PluginCategoryMapping.AUTHOR_GUITARIX -> 4
+                PluginCategoryMapping.AUTHOR_BRUMMER10 -> 5
+                PluginCategoryMapping.AUTHOR_GXPLUGINS -> 6
+                else -> 7
             }
         }
 
@@ -496,7 +579,175 @@ class PluginBrowserViewModel(application: Application) : AndroidViewModel(applic
         _groupedPlugins.value = groupPluginsByAuthorAndCategory(_plugins.value)
     }
 
+    /** True when this plugin came from a user-imported bundle. */
+    private fun isImported(plugin: PluginInfo): Boolean =
+        plugin.format == "LV2" && importedUris.contains(plugin.id)
+
+    /**
+     * Re-scan the native plugin sources, then reload the browser list.
+     *
+     * The native refresh is what makes a bundle imported by another screen (or a
+     * deleted one) show up here; it is cheap when nothing changed, because the
+     * LV2 factory only loads bundles it has never seen.
+     */
     fun refresh() {
-        loadPlugins()
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { NativeEngine.getInstance().nativeRefreshPluginRegistry() }
+                loadMetadata()
+            }
+            loadPluginsInternal()
+        }
     }
+
+    /** Import an LV2 bundle from a ZIP archive picked with OpenDocument. */
+    fun importZip(uri: Uri) {
+        if (!importEnabled) return
+        runImport("Importing LV2 bundle") { id ->
+            val resolver = appContext.contentResolver
+            val name = Lv2SafSources.displayName(resolver, uri)
+            if (!Lv2SafSources.looksLikeZip(resolver, uri)) {
+                return@runImport Lv2BundleImporter.Result.Failure(
+                    "Selected file is not a ZIP archive"
+                )
+            }
+            Lv2SafSources.openZip(resolver, uri).use { stream ->
+                Lv2BundleImporter.import(ZipImportSource(stream, name), userDir(), id)
+            }
+        }
+    }
+
+    /** Import an LV2 bundle from a folder picked with OpenDocumentTree. */
+    fun importTree(uri: Uri) {
+        if (!importEnabled) return
+        runImport("Importing LV2 folder") { id ->
+            Lv2BundleImporter.import(
+                Lv2SafSources.treeSource(appContext.contentResolver, uri),
+                userDir(),
+                id,
+            )
+        }
+    }
+
+    /** Delete an imported bundle's files and tombstone its entry. */
+    fun removeImported(id: String) {
+        if (!importEnabled) return
+        if (_importState.value is Lv2ImportState.Running) return
+
+        _importState.value = Lv2ImportState.Running("Removing bundle")
+        viewModelScope.launch {
+            val state = withContext(Dispatchers.IO) {
+                runCatching {
+                    val entry = Lv2BundleRegistry.read(filesDir).firstOrNull { it.id == id }
+                    File(userDir(), id).deleteRecursively()
+                    Lv2BundleRegistry.markRemoved(filesDir, id)
+                    runCatching { NativeEngine.getInstance().nativeRefreshPluginRegistry() }
+                    loadMetadata()
+                    loadPluginsInternal()
+                    Lv2ImportState.Success(
+                        "Removed ${entry?.displayName ?: id} — hidden from the list now, " +
+                            "and gone from the engine on the next start"
+                    )
+                }.getOrElse {
+                    Lv2ImportState.Error("Could not remove the bundle: ${it.message}")
+                }
+            }
+            _importState.value = state
+        }
+    }
+
+    /** Clears a Success/Error banner after the UI has shown it. */
+    fun consumeImportResult() {
+        if (_importState.value is Lv2ImportState.Success || _importState.value is Lv2ImportState.Error) {
+            _importState.value = Lv2ImportState.Idle
+        }
+    }
+
+    private fun userDir(): File = Lv2BundleRegistry.userDir(filesDir)
+
+    private fun runImport(label: String, block: (id: String) -> Lv2BundleImporter.Result) {
+        if (_importState.value is Lv2ImportState.Running) return
+
+        _importState.value = Lv2ImportState.Running(label)
+        viewModelScope.launch {
+            // Everything, including the failure paths, has to end in a state:
+            // leaving Running set would keep the browser's menu disabled.
+            val state = runCatching {
+                withContext(Dispatchers.IO) {
+                    val id = UUID.randomUUID().toString()
+                    val before = nativeLv2Uris()
+                    val result = runCatching { block(id) }.getOrElse {
+                        Lv2BundleImporter.Result.Failure(it.message ?: "Import failed")
+                    }
+                    when (result) {
+                        is Lv2BundleImporter.Result.Failure -> Lv2ImportState.Error(result.reason)
+                        is Lv2BundleImporter.Result.Success -> registerImport(id, result, before)
+                    }
+                }
+            }.getOrElse { Lv2ImportState.Error(it.message ?: "Import failed") }
+
+            _importState.value = state
+        }
+    }
+
+    /** Record the imported bundle, ask the engine to rescan and store the URIs
+     *  the rescan attributed to it. */
+    private suspend fun registerImport(
+        id: String,
+        result: Lv2BundleImporter.Result.Success,
+        previousUris: Set<String>?,
+    ): Lv2ImportState {
+        Lv2BundleRegistry.add(
+            filesDir,
+            Lv2BundleEntry(
+                id = id,
+                displayName = result.displayName,
+                bundleDir = id,
+                uris = emptyList(),
+                importedAt = System.currentTimeMillis(),
+            ),
+        )
+
+        runCatching { NativeEngine.getInstance().nativeRefreshPluginRegistry() }
+        val after = nativeLv2Uris()
+        val enumerated = runCatching { RackManager.getAvailablePlugins() }.getOrNull().orEmpty()
+
+        // Where the engine says the plugin came from beats "what appeared in the
+        // rescan": the diff is empty when the engine was not enumerating, and it
+        // also picks up bundles another import added in between. The diff stays
+        // as a fallback for an engine that cannot report bundle paths.
+        val attributed = Lv2BundleAttribution.urisByBundle(enumerated, userDir())[id].orEmpty()
+        val uris = when {
+            attributed.isNotEmpty() -> attributed.sorted()
+            after == null -> emptyList()
+            previousUris == null -> after.sorted()
+            else -> (after - previousUris).sorted()
+        }
+        Lv2BundleRegistry.setUris(filesDir, id, uris)
+
+        loadMetadata()
+        loadPluginsInternal()
+
+        return when {
+            after == null -> Lv2ImportState.Success(
+                "Imported ${result.displayName}. Start the audio engine to load it."
+            )
+            uris.isEmpty() -> Lv2ImportState.Success(
+                "Imported ${result.displayName}, but no new plugins were detected — " +
+                    "duplicate URI or incompatible bundle"
+            )
+            else -> Lv2ImportState.Success(
+                "Imported ${result.displayName}: ${uris.size} plugin(s) added"
+            )
+        }
+    }
+
+    /** LV2 plugin URIs the engine currently knows, or null when the engine is not
+     *  running yet (the JNI call throws before nativeInit). */
+    private fun nativeLv2Uris(): Set<String>? = runCatching {
+        RackManager.getAvailablePlugins()
+            .filter { it.format == "LV2" }
+            .map { it.id }
+            .toSet()
+    }.getOrNull()
 }

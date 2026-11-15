@@ -130,6 +130,7 @@ add_library(plugin_abstraction STATIC
 # LV2 backend (conditional compilation)
 if(LV2_AVAILABLE)
     add_library(lv2_backend STATIC
+        plugin/lv2/LV2BundleScanner.cpp
         plugin/lv2/LV2Plugin.cpp
         plugin/lv2/LV2PluginFactory.cpp
         plugin/lv2/LV2PluginUI.cpp
@@ -147,6 +148,7 @@ if(LV2_AVAILABLE)
 else()
     # Create stub implementation when LV2 is not available
     add_library(lv2_backend STATIC
+        plugin/lv2/LV2BundleScanner.cpp
         plugin/lv2/LV2Plugin.cpp
         plugin/lv2/LV2PluginFactory.cpp
         plugin/lv2/LV2PluginUI.cpp

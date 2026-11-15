@@ -24,7 +24,7 @@ bool VstFactory::initialize() {
     return loadRegistry();
 }
 
-void VstFactory::refresh() { loadRegistry(); }
+bool VstFactory::refresh() { return loadRegistry(); }
 
 namespace {
 // Minimal extractor for the very narrow registry.json schema we control

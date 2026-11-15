@@ -34,6 +34,12 @@ namespace guitarrackcraft {
  *  Returns empty string if binary not found on disk. */
 std::string resolveX11UIBinaryPath(const LilvUI* ui, const LilvPlugin* plugin, LilvWorld* world);
 
+/** Absolute path of the bundle directory the plugin lives in, without a
+ *  trailing separator; empty when lilv cannot describe it. Always available,
+ *  unlike PluginInfo::modguiBasePath, which only exists for modgui bundles:
+ *  this is what ties a plugin URI back to the directory it was imported into. */
+std::string pluginBundlePath(const LilvPlugin* plugin);
+
 /** Discover modgui metadata (iconTemplate + basePath) from a plugin's bundle.
  *  Returns true if modgui was found and info fields were populated. */
 struct PluginInfo;
