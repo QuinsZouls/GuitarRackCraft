@@ -155,6 +155,48 @@ else()
                     "3rd_party/patches/neural-amp-modeler-lv2/0002-amp-controls-dsp.patch)")
 endif()
 
+# Audio engine host tests. AudioEngine.cpp itself cannot be built here (it needs
+# Oboe and liblog), so only the platform-independent helpers it uses are
+# covered: the latency arithmetic and the sample-format conversions. Both are
+# header-only and live under engine/, which is on the include path.
+add_executable(engine_unit_tests
+    engine/TestLatencyMath.cpp
+    engine/TestAudioFormatUtils.cpp
+)
+target_link_libraries(engine_unit_tests PRIVATE gtest_main)
+target_include_directories(engine_unit_tests PRIVATE ${CPP_SRC_DIR})
+
+# Lock-free utilities and the LV2 real-time mailboxes. SPSCRing.h is the only
+# shared-state primitive left in the LV2 audio path (the four mutexes it
+# replaces are gone), so it is covered on its own, including two-thread stress
+# tests and the drop-oldest accounting the audio thread relies on.
+# LV2RTMailbox.h has no lilv dependency, so it is testable even on a host
+# without the LV2 stack.
+add_executable(utils_unit_tests
+    utils/TestSPSCRing.cpp
+    utils/TestLV2RTMailbox.cpp
+)
+target_link_libraries(utils_unit_tests PRIVATE gtest_main pthread)
+target_include_directories(utils_unit_tests PRIVATE ${CPP_SRC_DIR})
+
+# The atom-input helper of the LV2 wrapper needs only the inline LV2 atom
+# headers (no lilv, no liblilv link), so it is host-testable even though
+# LV2Plugin.cpp itself is not: the repo ships liblilv only as an aarch64
+# archive, and building lilv for the host would need meson plus serd/sord/
+# sratom/zix, which this environment does not have. The wrapping of process()
+# around this helper is covered by the arm64 build of lv2_backend.
+set(LV2_HEADERS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../3rd_party/lv2/include)
+if(EXISTS ${LV2_HEADERS_DIR}/lv2/atom/util.h)
+    add_executable(lv2_atom_unit_tests
+        utils/TestLV2AtomInput.cpp
+    )
+    target_link_libraries(lv2_atom_unit_tests PRIVATE gtest_main)
+    target_include_directories(lv2_atom_unit_tests PRIVATE ${CPP_SRC_DIR} ${LV2_HEADERS_DIR})
+    message(STATUS "LV2 atom input tests: ENABLED")
+else()
+    message(WARNING "LV2 atom input tests: DISABLED (3rd_party/lv2 is not checked out)")
+endif()
+
 # CTest integration
 include(GoogleTest)
 gtest_discover_tests(x11_unit_tests)
@@ -163,6 +205,11 @@ if(TARGET x11_xcb_tests)
     gtest_discover_tests(x11_xcb_tests)
 endif()
 gtest_discover_tests(gain_unit_tests)
+gtest_discover_tests(engine_unit_tests)
+gtest_discover_tests(utils_unit_tests)
+if(TARGET lv2_atom_unit_tests)
+    gtest_discover_tests(lv2_atom_unit_tests)
+endif()
 if(TARGET dsp_unit_tests)
     gtest_discover_tests(dsp_unit_tests)
 endif()
