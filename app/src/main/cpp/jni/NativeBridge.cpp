@@ -799,7 +799,7 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeIsWavLoaded(JNIEnv* e
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeProcessFile(JNIEnv* env, jobject thiz, jstring inputPath, jstring outputPath) {
+Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeProcessFile(JNIEnv* env, jobject thiz, jstring inputPath, jstring outputPath, jfloat inputGainDb, jfloat outputGainDb) {
     if (!g_ctx || !g_ctx->offlineProcessor) {
         return JNI_FALSE;
     }
@@ -813,7 +813,10 @@ Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeProcessFile(JNIEnv* e
         return JNI_FALSE;
     }
 
-    bool result = g_ctx->offlineProcessor->processFile(std::string(inputStr), std::string(outputStr));
+    /* The output file has to carry the same global gain the live engine applies,
+     * so the two dB values travel with the round-trip gain staging request. */
+    bool result = g_ctx->offlineProcessor->processFile(std::string(inputStr), std::string(outputStr),
+                                                       nullptr, inputGainDb, outputGainDb);
 
     env->ReleaseStringUTFChars(inputPath, inputStr);
     env->ReleaseStringUTFChars(outputPath, outputStr);
@@ -1340,6 +1343,25 @@ JNIEXPORT void JNICALL
 Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeSetWavBypassChain(JNIEnv* /*env*/, jobject /*thiz*/, jboolean bypass) {
     if (g_ctx && g_ctx->audioEngine) {
         g_ctx->audioEngine->setWavBypassChain(bypass == JNI_TRUE);
+    }
+}
+
+/*
+ * Global gain stage (dB, clamped to [-24, +24] natively, default 0).
+ * Both take effect on the next audio callback: no engine restart, no
+ * reconfiguration, safe to call while audio is running.
+ */
+JNIEXPORT void JNICALL
+Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeSetGlobalInputGain(JNIEnv* /*env*/, jobject /*thiz*/, jfloat gainDb) {
+    if (g_ctx && g_ctx->audioEngine) {
+        g_ctx->audioEngine->setGlobalInputGainDb(static_cast<float>(gainDb));
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_varcain_guitarrackcraft_engine_NativeEngine_nativeSetGlobalOutputGain(JNIEnv* /*env*/, jobject /*thiz*/, jfloat gainDb) {
+    if (g_ctx && g_ctx->audioEngine) {
+        g_ctx->audioEngine->setGlobalOutputGainDb(static_cast<float>(gainDb));
     }
 }
 

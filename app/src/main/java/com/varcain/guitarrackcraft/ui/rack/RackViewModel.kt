@@ -24,6 +24,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.varcain.guitarrackcraft.engine.AudioEngine
+import com.varcain.guitarrackcraft.engine.AudioSettingsManager
 import com.varcain.guitarrackcraft.engine.NativeEngine
 import com.varcain.guitarrackcraft.engine.PresetManager
 import com.varcain.guitarrackcraft.engine.RackManager
@@ -196,11 +197,45 @@ class RackViewModel(application: Application) : AndroidViewModel(application) {
                 _isEngineRunning.value = started
                 if (started) {
                     _errorMessage.value = null
+                    pushPersistedGlobalGains()
                 }
             } catch (e: Exception) {
                 _errorMessage.value = "Failed to start engine: ${e.message}"
             }
         }
+    }
+
+    /**
+     * Hand the persisted global gains to the freshly started engine so the first block
+     * already runs at the user's gain staging. The native side starts at unity, so this
+     * is the only place that has to remember them; [restartEngine] inherits it for free.
+     */
+    private fun pushPersistedGlobalGains() {
+        val ctx = getApplication<Application>()
+        AudioEngine.setGlobalInputGain(AudioSettingsManager.getInputGainDb(ctx))
+        AudioEngine.setGlobalOutputGain(AudioSettingsManager.getOutputGainDb(ctx))
+    }
+
+    /**
+     * Apply a global input gain (dB, clamped to [-24, +24]) and persist it.
+     * Unlike device/buffer settings this is live: it never restarts the engine, so a
+     * slider drag is audible within the next audio callback and safe when stopped.
+     */
+    fun setGlobalInputGain(context: Context, db: Float) {
+        val gainDb = AudioSettingsManager.clampGainDb(db)
+        AudioSettingsManager.setInputGainDb(context, gainDb)
+        AudioEngine.setGlobalInputGain(gainDb)
+    }
+
+    /**
+     * Apply a global output gain (dB, clamped to [-24, +24]) and persist it.
+     * Unlike device/buffer settings this is live: it never restarts the engine, so a
+     * slider drag is audible within the next audio callback and safe when stopped.
+     */
+    fun setGlobalOutputGain(context: Context, db: Float) {
+        val gainDb = AudioSettingsManager.clampGainDb(db)
+        AudioSettingsManager.setOutputGainDb(context, gainDb)
+        AudioEngine.setGlobalOutputGain(gainDb)
     }
 
     private var restartJob: Job? = null

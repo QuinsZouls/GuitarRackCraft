@@ -54,10 +54,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.webkit.WebViewAssetLoader
-import android.app.Activity
 import android.content.pm.ActivityInfo
 import com.varcain.guitarrackcraft.engine.PluginInfo
 import com.varcain.guitarrackcraft.engine.RackManager
+import com.varcain.guitarrackcraft.ui.orientation.OrientationManager
 import java.io.File
 
 /**
@@ -126,6 +126,9 @@ class ModguiHostBridge(
     }
 }
 
+/** Orientation override token owned by this screen while it is visible. */
+private const val MODGUI_ORIENTATION_TOKEN = "modgui-fullscreen"
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun ModguiScreen(
@@ -137,15 +140,20 @@ fun ModguiScreen(
     val context = LocalContext.current
     val pluginInfo = remember(pluginIndex) { RackManager.getRackPluginInfo(pluginIndex) }
 
-    // Landscape orientation for wide plugins
-    val activity = context as? Activity
+    // Landscape orientation for wide plugins, dropped again when this screen goes away
+    // so the user's preference (not a hard portrait lock) comes back.
     LaunchedEffect(contentWidth, contentHeight) {
         if (contentWidth > 0 && contentHeight > 0 && contentWidth > contentHeight * 1.3) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE
+            OrientationManager.pushOverride(
+                MODGUI_ORIENTATION_TOKEN,
+                ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE
+            )
+        } else {
+            OrientationManager.popOverride(MODGUI_ORIENTATION_TOKEN)
         }
     }
     DisposableEffect(Unit) {
-        onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT }
+        onDispose { OrientationManager.popOverride(MODGUI_ORIENTATION_TOKEN) }
     }
 
     if (pluginInfo == null || !pluginInfo.hasModgui) {

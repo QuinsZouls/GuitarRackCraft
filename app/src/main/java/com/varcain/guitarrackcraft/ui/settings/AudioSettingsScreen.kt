@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -38,7 +39,11 @@ import androidx.compose.ui.text.font.FontWeight
 import com.varcain.guitarrackcraft.engine.AudioDeviceOption
 import com.varcain.guitarrackcraft.engine.AudioEngine
 import com.varcain.guitarrackcraft.engine.AudioSettingsManager
+import com.varcain.guitarrackcraft.ui.orientation.OrientationManager
+import com.varcain.guitarrackcraft.ui.orientation.OrientationMode
+import com.varcain.guitarrackcraft.ui.orientation.UiSettingsManager
 import com.varcain.guitarrackcraft.ui.rack.RackViewModel
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -55,6 +60,10 @@ fun AudioSettingsScreen(
     var selectedOutputId by remember { mutableIntStateOf(AudioSettingsManager.getOutputDeviceId(context)) }
     var selectedBufferSize by remember { mutableIntStateOf(AudioSettingsManager.getBufferSize(context)) }
     var refreshKey by remember { mutableIntStateOf(0) }
+
+    var inputGainDb by remember { mutableFloatStateOf(AudioSettingsManager.getInputGainDb(context)) }
+    var outputGainDb by remember { mutableFloatStateOf(AudioSettingsManager.getOutputGainDb(context)) }
+    var orientationMode by remember { mutableStateOf(UiSettingsManager.getOrientationMode(context)) }
 
     BackHandler { onNavigateBack() }
 
@@ -121,6 +130,66 @@ fun AudioSettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            // Gain changes are applied live by the view model; never restart the engine here
+            Divider()
+            Text(
+                text = "Global Gains",
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+            Text(
+                text = "Trims applied to the whole chain. Input Gain sits right after the input device " +
+                    "and before the rack, so it also trims WAV playback; Output Gain right after the rack " +
+                    "and before the output device. " +
+                    "Input VU/clip respond to the input trim, output VU/clip and recordings to both. " +
+                    "0 dB = unity (no change). Adjustments are applied live, so the engine keeps running.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            GlobalGainSetting(
+                label = "Input Gain",
+                valueDb = inputGainDb,
+                onValueChange = { db ->
+                    inputGainDb = db
+                    viewModel.setGlobalInputGain(context, db)
+                }
+            )
+
+            GlobalGainSetting(
+                label = "Output Gain",
+                valueDb = outputGainDb,
+                onValueChange = { db ->
+                    outputGainDb = db
+                    viewModel.setGlobalOutputGain(context, db)
+                }
+            )
+
+            // Orientation is applied by the orientation manager itself; never restart the engine here
+            Divider()
+            Text(
+                text = "Display",
+                style = MaterialTheme.typography.labelLarge,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+            LabeledDropdown(
+                label = "Screen Orientation",
+                selectedLabel = orientationMode.label,
+                options = OrientationMode.entries.map { it.label to it },
+                onSelected = { mode ->
+                    orientationMode = mode
+                    OrientationManager.setMode(context, mode)
+                }
+            )
+            Text(
+                text = "Auto follows the device sensor or the system rotation lock. Portrait and " +
+                    "Landscape lock the app to that orientation. The rack, plugin editors and meters " +
+                    "adapt to both orientations; a fullscreen plugin editor still takes over while it " +
+                    "is open and restores your choice on exit.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
             // Current engine info + low-latency checklist
             val isRunning by viewModel.isEngineRunning.collectAsState()
             if (isRunning) {
@@ -165,6 +234,66 @@ fun AudioSettingsScreen(
         }
     }
 }
+
+@Composable
+private fun GlobalGainSetting(
+    label: String,
+    valueDb: Float,
+    onValueChange: (Float) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = formatGainDb(valueDb),
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            TextButton(
+                onClick = { onValueChange(AudioSettingsManager.DEFAULT_GAIN_DB) },
+                enabled = valueDb != AudioSettingsManager.DEFAULT_GAIN_DB,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(text = "Reset", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        Slider(
+            value = valueDb,
+            onValueChange = { onValueChange(stepGainDb(it)) },
+            valueRange = AudioSettingsManager.MIN_GAIN_DB..AudioSettingsManager.MAX_GAIN_DB,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            GainScaleLabel("%.0f dB".format(AudioSettingsManager.MIN_GAIN_DB))
+            GainScaleLabel(formatGainDb(AudioSettingsManager.DEFAULT_GAIN_DB))
+            GainScaleLabel("%.0f dB".format(AudioSettingsManager.MAX_GAIN_DB))
+        }
+    }
+}
+
+@Composable
+private fun GainScaleLabel(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+}
+
+private fun formatGainDb(db: Float): String = "%.1f dB".format(db)
+
+private fun stepGainDb(db: Float): Float =
+    (AudioSettingsManager.clampGainDb(db) * 10f).roundToInt() / 10f
 
 @Composable
 private fun InfoRow(label: String, value: String) {
@@ -257,6 +386,53 @@ private fun DeviceDropdown(
                         text = { Text(device.name) },
                         onClick = {
                             onSelected(device.id)
+                            expanded = false
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun <T> LabeledDropdown(
+    label: String,
+    selectedLabel: String,
+    options: List<Pair<String, T>>,
+    onSelected: (T) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Column {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(bottom = 4.dp)
+        )
+        ExposedDropdownMenuBox(
+            expanded = expanded,
+            onExpandedChange = { expanded = it }
+        ) {
+            OutlinedTextField(
+                value = selectedLabel,
+                onValueChange = {},
+                readOnly = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(),
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) }
+            )
+            ExposedDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false }
+            ) {
+                options.forEach { (optionLabel, value) ->
+                    DropdownMenuItem(
+                        text = { Text(optionLabel) },
+                        onClick = {
+                            onSelected(value)
                             expanded = false
                         }
                     )

@@ -1,0 +1,160 @@
+diff --git a/resources/modgui.ttl b/resources/modgui.ttl
+index 360d26f..e95bafc 100644
+--- a/resources/modgui.ttl
++++ b/resources/modgui.ttl
+@@ -15,6 +15,26 @@
+             lv2:name "Input Lvl";
+         ], [
+             lv2:index 1;
++            lv2:symbol "gain";
++            lv2:name "Gain";
++        ], [
++            lv2:index 2;
++            lv2:symbol "bass";
++            lv2:name "Bass";
++        ], [
++            lv2:index 3;
++            lv2:symbol "mid";
++            lv2:name "Mid";
++        ], [
++            lv2:index 4;
++            lv2:symbol "treble";
++            lv2:name "Treble";
++        ], [
++            lv2:index 5;
++            lv2:symbol "presence";
++            lv2:name "Presence";
++        ], [
++            lv2:index 6;
+             lv2:symbol "output_level";
+             lv2:name "Output Lvl";
+         ];
+diff --git a/resources/modgui/stylesheet-nam.css b/resources/modgui/stylesheet-nam.css
+index 7f9632b..2472185 100644
+--- a/resources/modgui/stylesheet-nam.css
++++ b/resources/modgui/stylesheet-nam.css
+@@ -45,9 +45,25 @@
+     display:inline;
+ }
+ 
+-.mod-pedal-nam .group1 {
+-    top:86px;
+-    left:22px;
++/* Seven knobs in one row across the top band (y 20..98). The 20px gaps above
++   and below keep the row's flow box 118px tall, which is what puts group2's
++   model selector back in the artwork's display window (y 225) as before. */
++.mod-pedal-nam .mod-control-group.group1 {
++    margin:20px 0px;
++    height:78px;
++    display:flex;
++    justify-content:space-evenly;
++    align-items:flex-start;
++}
++
++/* Inside a flex container the base stylesheet's .clearfix ::before/::after
++   become flex items of their own: two empty boxes that take two of
++   space-evenly's gaps, so the knobs sit 11.2px apart with 22.4px of dead space
++   at each end instead of an even 14px. group1 holds no floats and a flex
++   container already contains its items, so drop them. */
++.mod-pedal-nam .group1.clearfix::before,
++.mod-pedal-nam .group1.clearfix::after {
++    display:none;
+ }
+ 
+ .mod-pedal-nam .group2 {
+@@ -58,29 +74,30 @@
+ .mod-pedal-nam .mod-control-group .mod-knob .mod-knob-title {
+     text-align: center;
+     color:white;
++    font-size:10px;
++    line-height:14px;
++    height:14px;
++    overflow:hidden;
++    white-space:nowrap;
+ }
+ 
+ .mod-pedal-nam .mod-control-group .mod-knob {
+     overflow:hidden;
+     position:relative;
+     display:inline-block;
+-}
+-
+-.mod-pedal-nam .mod-control-group .mod-knob:first-child {
+-    margin-left: 0px;
+-}
+-
+-.mod-pedal-nam .mod-control-group .mod-knob:last-child {
+-    margin-left: 315px;
++    width:64px;
+ }
+ 
+ .mod-pedal-nam .mod-control-group .mod-knob .mod-knob-image {
+     background-image:url(/resources/knob.png{{{ns}}});
+     background-position:left center;
+     background-repeat:no-repeat;
+-    background-size:5000px 100px;
+-    height:100px;
+-    width:100px;
++    /* knob.png is 5000x100: 50 frames of 100x100. Scaled to 3200x64 the frame
++       is exactly the 64x64 element (0.64 on both axes, round(3200/64) = 50
++       frames in modgui_runtime.js), so nothing is cropped or stretched. */
++    background-size:3200px 64px;
++    height:64px;
++    width:64px;
+     cursor:pointer;
+ }
+ 
+diff --git a/resources/neural_amp_modeler.ttl.in b/resources/neural_amp_modeler.ttl.in
+index 8df26af..5df5f48 100644
+--- a/resources/neural_amp_modeler.ttl.in
++++ b/resources/neural_amp_modeler.ttl.in
+@@ -109,4 +109,49 @@ A large collection of models is available at https://tonehunt.org
+ 		lv2:default 1.0;
+ 		lv2:minimum 0.0;
+ 		lv2:maximum 1.0;
++	], [
++		a lv2:ControlPort, lv2:InputPort;
++		lv2:index 7;
++		lv2:symbol "gain";
++		lv2:name "Gain";
++		lv2:default 0.0;
++		lv2:minimum -24.0;
++		lv2:maximum 24.0;
++		units:unit units:db;
++	], [
++		a lv2:ControlPort, lv2:InputPort;
++		lv2:index 8;
++		lv2:symbol "bass";
++		lv2:name "Bass";
++		lv2:default 0.0;
++		lv2:minimum -12.0;
++		lv2:maximum 12.0;
++		units:unit units:db;
++	], [
++		a lv2:ControlPort, lv2:InputPort;
++		lv2:index 9;
++		lv2:symbol "mid";
++		lv2:name "Mid";
++		lv2:default 0.0;
++		lv2:minimum -12.0;
++		lv2:maximum 12.0;
++		units:unit units:db;
++	], [
++		a lv2:ControlPort, lv2:InputPort;
++		lv2:index 10;
++		lv2:symbol "treble";
++		lv2:name "Treble";
++		lv2:default 0.0;
++		lv2:minimum -12.0;
++		lv2:maximum 12.0;
++		units:unit units:db;
++	], [
++		a lv2:ControlPort, lv2:InputPort;
++		lv2:index 11;
++		lv2:symbol "presence";
++		lv2:name "Presence";
++		lv2:default 0.0;
++		lv2:minimum -12.0;
++		lv2:maximum 12.0;
++		units:unit units:db;
+ 	].

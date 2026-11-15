@@ -45,6 +45,7 @@ import com.varcain.guitarrackcraft.engine.AudioEngine
 import com.varcain.guitarrackcraft.engine.EngineInitHelper
 import com.varcain.guitarrackcraft.ui.loading.PluginExtractScreen
 import com.varcain.guitarrackcraft.ui.navigation.AppNavigation
+import com.varcain.guitarrackcraft.ui.orientation.OrientationManager
 import com.varcain.guitarrackcraft.ui.theme.GuitarRackCraftTheme
 import com.varcain.guitarrackcraft.ui.tone3000.Tone3000CallbackHandler
 import kotlinx.coroutines.Dispatchers
@@ -98,6 +99,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        OrientationManager.init(this)
 
         // Handle auth callback if activity started via deep link
         handleAuthIntent(intent)

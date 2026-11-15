@@ -22,6 +22,8 @@
 
 #include <string>
 #include <functional>
+#include <cstdint>
+#include "dsp/GlobalGain.h"
 #include "plugin/PluginChain.h"
 
 namespace guitarrackcraft {
@@ -42,12 +44,39 @@ public:
      * @param inputPath Path to input WAV file
      * @param outputPath Path to output WAV file
      * @param progressCallback Optional callback for progress updates (0.0-1.0)
+     * @param inputGainDb Global input gain in dB, applied to the input block
+     *        before the chain (default 0 dB = unity)
+     * @param outputGainDb Global output gain in dB, applied to the output block
+     *        after the chain (default 0 dB = unity)
      * @return true if processing succeeded
      */
     bool processFile(
         const std::string& inputPath,
         const std::string& outputPath,
-        ProgressCallback progressCallback = nullptr);
+        ProgressCallback progressCallback = nullptr,
+        float inputGainDb = GlobalGain::kUnityDb,
+        float outputGainDb = GlobalGain::kUnityDb);
+
+    /**
+     * Apply a global gain to one stereo block with a constant factor.
+     *
+     * Offline processing is not real-time, so the zipper noise a live ramp
+     * exists to hide cannot happen here; more importantly the exported file must
+     * carry exactly the steady-state gain the live engine converges to, so the
+     * helper snaps to the target for every block instead of ramping across it.
+     * Unity (0 dB) leaves the samples bit-identical, and the dB value is clamped
+     * by GlobalGain exactly like the live path (NaN maps to GlobalGain::kMinDb).
+     *
+     * @param left Left channel block, scaled in place
+     * @param right Right channel block, scaled in place
+     * @param numFrames Frames in each block
+     * @param gainDb Gain in dB
+     */
+    static void applyConstantGainDb(float* left, float* right, int32_t numFrames, float gainDb) {
+        GlobalGain gain;
+        gain.snapTo(gainDb);
+        gain.process(left, right, numFrames, gainDb);
+    }
 
 private:
     PluginChain& chain_;

@@ -34,6 +34,13 @@ object AudioSettingsManager {
     private const val KEY_INPUT_DEVICE_ID = "inputDeviceId"
     private const val KEY_OUTPUT_DEVICE_ID = "outputDeviceId"
     private const val KEY_BUFFER_SIZE = "bufferSize"
+    private const val KEY_INPUT_GAIN_DB = "inputGainDb"
+    private const val KEY_OUTPUT_GAIN_DB = "outputGainDb"
+
+    /** Global gain range in dB, mirrored by the native clamp and used by the settings UI. */
+    const val MIN_GAIN_DB = -24f
+    const val MAX_GAIN_DB = 24f
+    const val DEFAULT_GAIN_DB = 0f
 
     val BUFFER_SIZE_OPTIONS = listOf(
         0 to "Auto",
@@ -68,6 +75,27 @@ object AudioSettingsManager {
 
     fun setBufferSize(context: Context, size: Int) {
         prefs(context).edit().putInt(KEY_BUFFER_SIZE, size).apply()
+    }
+
+    /**
+     * Coerce a gain in dB to the supported range. NaN (from a corrupt preference or a
+     * slider divide-by-zero) falls back to unity instead of poisoning the audio path.
+     */
+    fun clampGainDb(db: Float): Float =
+        if (db.isNaN()) DEFAULT_GAIN_DB else db.coerceIn(MIN_GAIN_DB, MAX_GAIN_DB)
+
+    fun getInputGainDb(context: Context): Float =
+        clampGainDb(prefs(context).getFloat(KEY_INPUT_GAIN_DB, DEFAULT_GAIN_DB))
+
+    fun setInputGainDb(context: Context, db: Float) {
+        prefs(context).edit().putFloat(KEY_INPUT_GAIN_DB, clampGainDb(db)).apply()
+    }
+
+    fun getOutputGainDb(context: Context): Float =
+        clampGainDb(prefs(context).getFloat(KEY_OUTPUT_GAIN_DB, DEFAULT_GAIN_DB))
+
+    fun setOutputGainDb(context: Context, db: Float) {
+        prefs(context).edit().putFloat(KEY_OUTPUT_GAIN_DB, clampGainDb(db)).apply()
     }
 
     fun getInputDevices(context: Context): List<AudioDeviceOption> {

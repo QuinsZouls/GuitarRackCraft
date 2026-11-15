@@ -41,4 +41,30 @@ object AudioEngine {
     fun isInputClipping(): Boolean = native.isInputClipping()
     fun isOutputClipping(): Boolean = native.isOutputClipping()
     fun resetClipping() = native.resetClipping()
+
+    /**
+     * Global input gain in dB, applied to the mic/WAV input before metering and
+     * plugin processing. Range [-24, +24], 0 dB = unity. Takes effect on the next
+     * audio callback: call it live while the engine runs, never restart for it.
+     *
+     * The value is coerced by [AudioSettingsManager.clampGainDb] before it leaves
+     * Kotlin, so this public entry point cannot forward an unvalidated number even
+     * when the caller bypasses the view model: out-of-range values land on the
+     * nearest endpoint and NaN falls back to unity. The native stage clamps as
+     * well, but it maps NaN to -24 dB, which would contradict the Kotlin-side
+     * "NaN means no change" rule if it ever had to handle one.
+     */
+    fun setGlobalInputGain(db: Float) =
+        native.setGlobalInputGain(AudioSettingsManager.clampGainDb(db))
+
+    /**
+     * Global output gain in dB, applied to the processed (or bypassed) output before
+     * output metering and recording. Range [-24, +24], 0 dB = unity. Takes effect on
+     * the next audio callback: call it live while the engine runs, never restart for it.
+     *
+     * Clamped like [setGlobalInputGain] so every facade caller sees the same
+     * range and NaN policy as the settings screen.
+     */
+    fun setGlobalOutputGain(db: Float) =
+        native.setGlobalOutputGain(AudioSettingsManager.clampGainDb(db))
 }

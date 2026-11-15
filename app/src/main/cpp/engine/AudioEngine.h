@@ -28,6 +28,7 @@
 #include <vector>
 #include "plugin/PluginChain.h"
 #include "AudioRecorder.h"
+#include "dsp/GlobalGain.h"
 
 namespace guitarrackcraft {
 
@@ -138,6 +139,22 @@ public:
     void setWavBypassChain(bool bypass) { wavBypassChain_.store(bypass); }
 
     /**
+     * Global input gain in dB, applied to the mic/WAV input before any metering,
+     * recording or plugin processing. Clamped to [-24, +24]; default 0 dB.
+     * Takes effect on the next audio callback — no engine restart.
+     */
+    void setGlobalInputGainDb(float db) { globalInputGainDb_.store(GlobalGain::clampDb(db)); }
+    float getGlobalInputGainDb() const { return globalInputGainDb_.load(); }
+
+    /**
+     * Global output gain in dB, applied to the processed (or bypassed) output
+     * before output metering, recording and the final interleave.
+     * Clamped to [-24, +24]; default 0 dB. Takes effect on the next callback.
+     */
+    void setGlobalOutputGainDb(float db) { globalOutputGainDb_.store(GlobalGain::clampDb(db)); }
+    float getGlobalOutputGainDb() const { return globalOutputGainDb_.load(); }
+
+    /**
      * Get the audio recorder for real-time recording of raw input and processed output.
      */
     AudioRecorder& getRecorder() { return recorder_; }
@@ -185,6 +202,14 @@ private:
     uint32_t callbackFrameCount_ = 0;  // Power-of-2 frames per audio callback
     std::atomic<bool> isRunning_;
     std::atomic<bool> chainBypass_{false};  // skip chain processing (passthrough)
+
+    // Global gain targets in dB (written from the UI thread, read per callback).
+    // The ramp state that actually reaches the samples lives in the GlobalGain
+    // instances below, which are audio-thread-only.
+    std::atomic<float> globalInputGainDb_{GlobalGain::kUnityDb};
+    std::atomic<float> globalOutputGainDb_{GlobalGain::kUnityDb};
+    GlobalGain inputGain_;
+    GlobalGain outputGain_;
 
     // Audio buffers for processing
     std::vector<float> inputBuffer_;

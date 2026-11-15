@@ -99,10 +99,10 @@ import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import android.app.Activity
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.provider.OpenableColumns
@@ -119,6 +119,7 @@ import com.varcain.guitarrackcraft.engine.X11Bridge
 import com.varcain.guitarrackcraft.engine.PluginInfo
 import com.varcain.guitarrackcraft.engine.UiType
 import com.varcain.guitarrackcraft.ui.modgui.InlineModguiView
+import com.varcain.guitarrackcraft.ui.orientation.OrientationManager
 import com.varcain.guitarrackcraft.ui.x11.PluginX11UiView
 import com.varcain.guitarrackcraft.ui.x11.X11DisplayManager
 import android.net.Uri
@@ -297,19 +298,22 @@ fun RackScreen(
     var fullscreenPluginHeight by rememberSaveable { mutableIntStateOf(0) }
     val isFullscreenActive = fullscreenPluginIndex != null
 
-    // Orientation handling for fullscreen
-    val activity = context as? Activity
+    // Orientation handling for fullscreen: wide editors ask for landscape while they are
+    // open, and leaving fullscreen drops the request so the user's preference comes back.
     LaunchedEffect(fullscreenPluginIndex) {
-        if (fullscreenPluginIndex != null && fullscreenPluginWidth > 0 && fullscreenPluginHeight > 0) {
-            if (fullscreenPluginWidth > fullscreenPluginHeight * 1.3) {
-                activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE
-            }
-        } else if (fullscreenPluginIndex == null) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        if (fullscreenPluginIndex != null && fullscreenPluginWidth > 0 && fullscreenPluginHeight > 0 &&
+            fullscreenPluginWidth > fullscreenPluginHeight * 1.3
+        ) {
+            OrientationManager.pushOverride(
+                RACK_FULLSCREEN_ORIENTATION_TOKEN,
+                ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE
+            )
+        } else {
+            OrientationManager.popOverride(RACK_FULLSCREEN_ORIENTATION_TOKEN)
         }
     }
     DisposableEffect(Unit) {
-        onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT }
+        onDispose { OrientationManager.popOverride(RACK_FULLSCREEN_ORIENTATION_TOKEN) }
     }
     BackHandler(enabled = isFullscreenActive) {
         fullscreenPluginIndex = null
@@ -381,7 +385,17 @@ fun RackScreen(
                 MaterialTheme.colorScheme.onSurfaceVariant
 
             val cutoutPadding = WindowInsets.displayCutout.asPaddingValues()
+            val layoutDirection = LocalLayoutDirection.current
             val cutoutTop = cutoutPadding.calculateTopPadding()
+            // A top cutout sits in the status bar band: the meters keep splitting the notch
+            // (portrait). Without one, any notch is on a side (landscape), so the meters share
+            // the row and the whole bar is inset horizontally instead.
+            val notchInStatusBar = notchSplitsMeterRow(cutoutTop)
+            val meterRowHeight = meterBandHeight(cutoutTop)
+            val sideInsetStart =
+                if (notchInStatusBar) 0.dp else cutoutPadding.calculateStartPadding(layoutDirection)
+            val sideInsetEnd =
+                if (notchInStatusBar) 0.dp else cutoutPadding.calculateEndPadding(layoutDirection)
 
             // Get actual cutout bounds to center VU meters in each half
             val view = LocalView.current
@@ -406,48 +420,78 @@ fun RackScreen(
                 tonalElevation = 3.dp,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    // VU meters row — sits inside the cutout/status bar area
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = sideInsetStart, end = sideInsetEnd)
+                ) {
+                    // VU meters row — inside the cutout band when the notch is at the top
                     if (isEngineRunning) {
-                        BoxWithConstraints(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(cutoutTop)
-                        ) {
-                            val halfWidth = minOf(cutoutCenterStartDp, cutoutCenterEndDp)
-                            val meterWidth = halfWidth * 0.8f
+                        if (notchInStatusBar) {
+                            BoxWithConstraints(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(meterRowHeight)
+                            ) {
+                                val halfWidth = minOf(cutoutCenterStartDp, cutoutCenterEndDp)
+                                val meterWidth = halfWidth * 0.8f
 
+                                Row(
+                                    modifier = Modifier.fillMaxSize(),
+                                    horizontalArrangement = Arrangement.SpaceEvenly,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // In VU meter — centered in left half
+                                    Box(
+                                        modifier = Modifier.width(halfWidth),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        VuMeter(
+                                            modifier = Modifier.width(meterWidth),
+                                            label = "In",
+                                            level = inputLevel,
+                                            clipping = inputClipping,
+                                            onClippingTap = { viewModel.resetClipping() }
+                                        )
+                                    }
+                                    // Out VU meter — centered in right half
+                                    Box(
+                                        modifier = Modifier.width(halfWidth),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        VuMeter(
+                                            modifier = Modifier.width(meterWidth),
+                                            label = "Out",
+                                            level = outputLevel,
+                                            clipping = outputClipping,
+                                            onClippingTap = { viewModel.resetClipping() }
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
                             Row(
-                                modifier = Modifier.fillMaxSize(),
-                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(meterRowHeight)
+                                    .padding(horizontal = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // In VU meter — centered in left half
-                                Box(
-                                    modifier = Modifier.width(halfWidth),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    VuMeter(
-                                        modifier = Modifier.width(meterWidth),
-                                        label = "In",
-                                        level = inputLevel,
-                                        clipping = inputClipping,
-                                        onClippingTap = { viewModel.resetClipping() }
-                                    )
-                                }
-                                // Out VU meter — centered in right half
-                                Box(
-                                    modifier = Modifier.width(halfWidth),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    VuMeter(
-                                        modifier = Modifier.width(meterWidth),
-                                        label = "Out",
-                                        level = outputLevel,
-                                        clipping = outputClipping,
-                                        onClippingTap = { viewModel.resetClipping() }
-                                    )
-                                }
+                                VuMeter(
+                                    modifier = Modifier.weight(1f),
+                                    label = "In",
+                                    level = inputLevel,
+                                    clipping = inputClipping,
+                                    onClippingTap = { viewModel.resetClipping() }
+                                )
+                                VuMeter(
+                                    modifier = Modifier.weight(1f),
+                                    label = "Out",
+                                    level = outputLevel,
+                                    clipping = outputClipping,
+                                    onClippingTap = { viewModel.resetClipping() }
+                                )
                             }
                         }
                     } else {
@@ -1051,6 +1095,23 @@ private fun defaultScaleForAspectRatio(width: Int, height: Int): Float =
 
 /** Fixed height for the X11 plugin viewport so the X server root window matches the plugin box (not full screen). */
 private val x11ViewportHeight = 360.dp
+
+/** Orientation override token owned by this screen's plugin fullscreen mode. */
+private const val RACK_FULLSCREEN_ORIENTATION_TOKEN = "rack-fullscreen"
+
+/**
+ * True when the display cutout eats into the status bar band, which is the portrait layout:
+ * the meters sit either side of the notch. In landscape the notch moves to a side edge, the
+ * top inset collapses to zero and the meters share one row instead.
+ */
+internal fun notchSplitsMeterRow(cutoutTop: Dp): Boolean = cutoutTop > 0.dp
+
+/** Meter band height: the cutout inset, but never thinner than a readable row. */
+internal fun meterBandHeight(cutoutTop: Dp): Dp = maxOf(cutoutTop, 24.dp)
+
+/** Inline X11 viewport height while the plugin's natural size is still unknown. */
+internal fun unknownX11ViewportHeight(viewportBudget: Dp): Dp =
+    minOf(x11ViewportHeight, viewportBudget * 0.5f)
 
 @Composable
 private fun ResizeHandle(
@@ -1672,6 +1733,12 @@ fun PluginCard(
                     ) {
                         val userScale = if (isFullscreen) 1f else if (x11UserScale.isNaN()) 1f else x11UserScale
                         val effectiveScale = if (isFullscreen) 1f else (x11UIScale * userScale).coerceIn(0.3f, 1f)
+                        // Size is unknown until the plugin reports one: the strip stays a
+                        // fraction of the visible viewport so it does not eat a landscape screen.
+                        // maxHeight is unbounded inside the rack's scrolling column, so screenHeight
+                        // (the scaffold viewport already passed down) is the finite bound.
+                        val viewportBudget = if (screenHeight > 0.dp) minOf(maxHeight, screenHeight) else maxHeight
+                        val unknownSizeHeight = unknownX11ViewportHeight(viewportBudget)
                         val x11Height = if (isFullscreen && x11PluginNaturalW > 0 && x11PluginNaturalH > 0) {
                             // Aspect-fit to screen
                             val aspect = x11PluginNaturalH.toFloat() / x11PluginNaturalW.toFloat()
@@ -1680,7 +1747,7 @@ fun PluginCard(
                         } else if (x11PluginNaturalW > 0 && x11PluginNaturalH > 0) {
                             maxWidth * effectiveScale * (x11PluginNaturalH.toFloat() / x11PluginNaturalW.toFloat())
                         } else {
-                            if (isFullscreen) screenHeight else x11ViewportHeight
+                            if (isFullscreen) screenHeight else unknownSizeHeight
                         }
                         val x11Visible = currentUiMode == UiType.X11
                         val x11ShowContent = x11Visible && x11UiReady

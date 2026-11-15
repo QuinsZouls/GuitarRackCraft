@@ -15,31 +15,62 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
-import android.content.res.Configuration
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.varcain.vsthost.NativeBridge
 import com.varcain.vsthost.util.X11Keymap
 
 /** Render one plugin's editor.
  *
- *  The SurfaceView's aspect ratio is FIXED at mount time. Changing it on
- *  the fly re-fires surfaceChanged and triggers Adreno-side EGL races
- *  (observed SIGSEGV inside libGLESv2_adreno.so during eglSwapBuffers).
+ *  The SurfaceView's dp size is CHOSEN ONCE, at the first layout of a mount,
+ *  and afterwards only re-centered — never resized. Resizing a surface that is
+ *  already attached re-fires surfaceChanged → nativeAttachSurfaceToX11Display,
+ *  which tears the EGL window surface down and builds a new one under the
+ *  compositor's feet; on Adreno that races libGLESv2_adreno.so and has been
+ *  observed to SIGSEGV inside eglSwapBuffers. GuitarRackCraft handles
+ *  orientation changes without recreating the activity, so a rotation
+ *  recomposes us with brand-new constraints while the very same SurfaceView
+ *  stays attached: the rotation-safe answer is to keep the size and center it
+ *  (letterbox) inside whatever box we now get. No size change ⇒ no
+ *  surfaceChanged ⇒ no re-attach ⇒ no EGL teardown.
  *
- *  The X11 server's renderer letterboxes the plugin's framebuffer inside
- *  the surface and `injectTouch` reverses the same scale/offset, so any
- *  fixed aspect ratio works — the plugin just gets centered with black
- *  bars when its native size doesn't match the viewport. */
+ *  A mount whose first fit is degenerate (0×0) is postponed instead of being
+ *  mounted at the 1 dp floor: the view only appears once a real box is chosen,
+ *  and that box is frozen immediately, so deferring never turns into a resize
+ *  either.
+ *
+ *  The X11 server's renderer letterboxes the plugin's framebuffer inside the
+ *  surface and `injectTouch` reverses the same scale/offset, so any fixed
+ *  surface size works — the plugin just gets centered with black bars when its
+ *  native size doesn't match the viewport.
+ *
+ *  ACCEPTED LIMITATION (v1): a mounted inline editor keeps its mount-time
+ *  size. After a rotation it is centered instead of re-fitted, so it is
+ *  letterboxed when the frozen box is smaller than the viewport and overflows
+ *  (cropped by the parent, if the parent clips) when it is wider/taller. The
+ *  rack's scale handle behaves the same way: it re-sizes the box around the
+ *  surface, not the surface itself; a new size takes effect on the next mount
+ *  (mode switch, editor reopen). Fullscreen `VstEditorActivity` and the
+ *  installer mount a fresh surface, so they still get the full available size.
+ *
+ *  The proper fix is deferred geometry: let vsthost's native side re-run
+ *  ANativeWindow_setBuffersGeometry / recreate the EGL surface at a safe point
+ *  (the LV2 path already does exactly that via X11Bridge.setSurfaceSize) —
+ *  explicit follow-up, deliberately not done here because it is a native
+ *  change. */
 @Composable
 fun PluginSurface(
     displayNumber: Int,
@@ -63,29 +94,104 @@ fun PluginSurface(
         }
     }
 
-    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    val aspect = pluginWidth.toFloat() / pluginHeight.toFloat()
-    BoxWithConstraints(
-        modifier = if (isLandscape) modifier.fillMaxSize() else modifier.fillMaxWidth(),
-        contentAlignment = Alignment.Center,
-    ) {
-        // Fit-inside (letterbox), never fill-and-crop: match whichever viewport edge actually
-        // binds. A very wide editor (Anvil 892x210, aspect ~4.25) in landscape is wider than the
-        // viewport (~2.2), so match WIDTH; a taller-relative editor matches HEIGHT. Hardcoding
-        // matchHeightConstraintsFirst=true made wide editors overflow the width → zoomed+cropped.
-        val viewportAspect = maxWidth / maxHeight
-        AndroidView(
-            modifier = if (isLandscape) {
-                Modifier.fillMaxSize().aspectRatio(aspect, matchHeightConstraintsFirst = aspect <= viewportAspect)
-            } else {
-                Modifier.fillMaxWidth().aspectRatio(aspect)
-            },
-            factory = { ctx ->
-                EditorSurfaceView(ctx, displayNumber).also {
-                    EditorViewRegistry.register(displayNumber, it)
-                }
-            },
+    val aspect = pluginAspect(pluginWidth, pluginHeight)
+    BoxWithConstraints(modifier = modifier, contentAlignment = Alignment.Center) {
+        // Fit-inside (letterbox), never fill-and-crop: match whichever viewport
+        // edge actually binds. A very wide editor (Anvil 892x210, aspect ~4.25)
+        // in a narrow viewport is width-bound; a taller-relative editor is
+        // height-bound. An unbounded axis (inline-in-a-scrollable-column sends
+        // maxHeight = ∞) falls back to a width-bound fit instead of producing
+        // an infinite or zero-sized surface.
+        val fit = fitInsideSurface(
+            aspect = aspect,
+            maxWidth = maxWidth,
+            widthBounded = constraints.hasBoundedWidth,
+            maxHeight = maxHeight,
+            heightBounded = constraints.hasBoundedHeight,
         )
+        // Per displayNumber so re-entering the same editor reuses the size it
+        // mounted with, and a different displayNumber starts from its own.
+        // Keyed on the plugin's native size too: that only changes when the
+        // editor itself is re-mounted (a resize would re-attach the surface
+        // anyway). rememberSaveable, not key(), so neither the AndroidView slot
+        // nor the SurfaceView identity changes when the value is restored.
+        var frozen by rememberSaveable(
+            displayNumber,
+            pluginWidth,
+            pluginHeight,
+            stateSaver = FrozenSurfaceSizeSaver,
+        ) {
+            mutableStateOf(FrozenSurfaceSize.Unchosen)
+        }
+        SideEffect {
+            if (!frozen.isChosen && fit.isChosen) frozen = fit
+        }
+        val surface = if (frozen.isChosen) frozen else fit
+        // Mount only once a real size exists. A degenerate first layout (0×0,
+        // e.g. the first frame of a freshly attached window) would otherwise
+        // mount at MinSurfaceEdge and then jump to the real size, which is the
+        // very surfaceChanged → re-attach this freeze exists to prevent. The
+        // SideEffect above freezes this same first non-degenerate fit within
+        // the frame, so mounted ⇒ frozen ⇒ never resized afterwards.
+        if (surface.isChosen) {
+            AndroidView(
+                // requiredSize, not size: an already-frozen box must not be
+                // coerced by a smaller parent, because shrinking it is exactly
+                // the re-attach that crashes. An oversized box is centered by
+                // the parent and overflows.
+                modifier = Modifier.requiredSize(
+                    surface.width.coerceAtLeast(MinSurfaceEdge),
+                    surface.height.coerceAtLeast(MinSurfaceEdge),
+                ),
+                factory = { ctx ->
+                    EditorSurfaceView(ctx, displayNumber).also {
+                        EditorViewRegistry.register(displayNumber, it)
+                    }
+                },
+            )
+        }
+    }
+}
+
+/** dp box chosen for a mounted surface. 0×0 means "not chosen yet". */
+private data class FrozenSurfaceSize(val width: Dp, val height: Dp) {
+    val isChosen: Boolean get() = width > 0.dp && height > 0.dp
+
+    companion object {
+        val Unchosen = FrozenSurfaceSize(0.dp, 0.dp)
+    }
+}
+
+private val FrozenSurfaceSizeSaver: Saver<FrozenSurfaceSize, List<Float>> = Saver(
+    save = { size -> if (size.isChosen) listOf(size.width.value, size.height.value) else null },
+    restore = { values -> FrozenSurfaceSize(values[0].dp, values[1].dp) },
+)
+
+/** Smallest edge we ever hand to a surface, so a degenerate constraint can
+ *  never produce a 0-pixel window surface. */
+private val MinSurfaceEdge = 1.dp
+
+/** Width used when the parent gives no bounded width (e.g. inside a
+ *  horizontally scrolling row). It only sizes the letterbox box, never the
+ *  plugin's framebuffer. */
+private val UnboundedWidthFallback = 360.dp
+
+private fun pluginAspect(pluginWidth: Int, pluginHeight: Int): Float =
+    if (pluginWidth > 0 && pluginHeight > 0) pluginWidth.toFloat() / pluginHeight.toFloat() else 1f
+
+private fun fitInsideSurface(
+    aspect: Float,
+    maxWidth: Dp,
+    widthBounded: Boolean,
+    maxHeight: Dp,
+    heightBounded: Boolean,
+): FrozenSurfaceSize {
+    val width = if (widthBounded) maxWidth else UnboundedWidthFallback
+    val heightForFullWidth = width / aspect
+    return when {
+        !heightBounded -> FrozenSurfaceSize(width, heightForFullWidth)
+        heightForFullWidth <= maxHeight -> FrozenSurfaceSize(width, heightForFullWidth)
+        else -> FrozenSurfaceSize(maxHeight * aspect, maxHeight)
     }
 }
 

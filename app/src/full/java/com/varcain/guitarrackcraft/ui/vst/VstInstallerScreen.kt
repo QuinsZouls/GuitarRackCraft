@@ -5,7 +5,6 @@
 
 package com.varcain.guitarrackcraft.ui.vst
 
-import android.app.Activity
 import android.content.pm.ActivityInfo
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -20,7 +19,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.text.style.TextOverflow
@@ -29,6 +27,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.varcain.vsthost.NativeBridge
 import com.varcain.vsthost.ui.EditorViewRegistry
 import com.varcain.vsthost.ui.PluginSurface
+import com.varcain.guitarrackcraft.ui.orientation.OrientationManager
+
+/** Orientation override token owned by the installer overlay while it is up. */
+private const val VST_INSTALLER_ORIENTATION_TOKEN = "vst-installer"
 
 /**
  * Full-screen overlay shown for the install-from-.exe flow. Rendered
@@ -52,12 +54,13 @@ fun VstInstallerScreen(vm: VstInstallerViewModel = viewModel()) {
 
     // Force landscape while the installer overlay is up — installer wizards
     // are 4:3 or 16:9 by convention and look squished/clipped in portrait.
-    // Restore default orientation when we exit back to IDLE.
-    val activity = LocalContext.current as? Activity
+    // The orientation manager restores the user's preference when we exit.
     DisposableEffect(Unit) {
-        val previous = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        onDispose { activity?.requestedOrientation = previous }
+        OrientationManager.pushOverride(
+            VST_INSTALLER_ORIENTATION_TOKEN,
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE,
+        )
+        onDispose { OrientationManager.popOverride(VST_INSTALLER_ORIENTATION_TOKEN) }
     }
 
     when (state) {

@@ -239,11 +239,21 @@ class NativeEngine private constructor() {
 
     /**
      * Process an audio file offline through the plugin chain.
+     * Offline processing is not real-time, so the global gains are applied as a
+     * constant factor per block instead of the live ramp; the result is the
+     * steady-state gain the live engine converges to.
      * @param inputPath Path to input WAV file
      * @param outputPath Path to output WAV file
+     * @param inputGainDb Global input gain in dB applied before the chain (0 = unity)
+     * @param outputGainDb Global output gain in dB applied after the chain (0 = unity)
      * @return true if processing succeeded
      */
-    external fun nativeProcessFile(inputPath: String, outputPath: String): Boolean
+    external fun nativeProcessFile(
+        inputPath: String,
+        outputPath: String,
+        inputGainDb: Float,
+        outputGainDb: Float
+    ): Boolean
 
     /**
      * Get the number of plugins in the rack.
@@ -420,6 +430,19 @@ class NativeEngine private constructor() {
     fun setChainBypass(bypass: Boolean) = nativeSetChainBypass(bypass)
     fun setWavBypassChain(bypass: Boolean) = nativeSetWavBypassChain(bypass)
 
+    // --- Global gain stage (dB, clamped natively to [-24, +24], 0 dB = unity) ---
+
+    /** Set the global input gain in dB. Natively clamped to [-24, +24] and applied
+     *  on the next audio callback, so it never needs an engine restart. */
+    external fun nativeSetGlobalInputGain(gainDb: Float)
+
+    /** Set the global output gain in dB. Natively clamped to [-24, +24] and applied
+     *  on the next audio callback, so it never needs an engine restart. */
+    external fun nativeSetGlobalOutputGain(gainDb: Float)
+
+    fun setGlobalInputGain(gainDb: Float) = nativeSetGlobalInputGain(gainDb)
+    fun setGlobalOutputGain(gainDb: Float) = nativeSetGlobalOutputGain(gainDb)
+
     fun startEngine(sampleRate: Float = 48000f, inputDeviceId: Int = 0, outputDeviceId: Int = 0, bufferFrames: Int = 0): Boolean {
         return nativeStartEngine(sampleRate, inputDeviceId, outputDeviceId, bufferFrames)
     }
@@ -488,8 +511,18 @@ class NativeEngine private constructor() {
         return nativeGetParameter(pluginIndex, portIndex)
     }
 
-    fun processFile(inputFile: File, outputFile: File): Boolean {
-        return nativeProcessFile(inputFile.absolutePath, outputFile.absolutePath)
+    fun processFile(
+        inputFile: File,
+        outputFile: File,
+        inputGainDb: Float = AudioSettingsManager.DEFAULT_GAIN_DB,
+        outputGainDb: Float = AudioSettingsManager.DEFAULT_GAIN_DB
+    ): Boolean {
+        return nativeProcessFile(
+            inputFile.absolutePath,
+            outputFile.absolutePath,
+            inputGainDb,
+            outputGainDb
+        )
     }
 
     fun getRackSize(): Int {

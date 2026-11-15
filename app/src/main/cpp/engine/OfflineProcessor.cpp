@@ -37,9 +37,18 @@ OfflineProcessor::OfflineProcessor(PluginChain& chain)
 bool OfflineProcessor::processFile(
     const std::string& inputPath,
     const std::string& outputPath,
-    ProgressCallback progressCallback) {
+    ProgressCallback progressCallback,
+    float inputGainDb,
+    float outputGainDb) {
     
     LOGI("Processing file: %s -> %s", inputPath.c_str(), outputPath.c_str());
+
+    // Same clamping the live engine applies in its gain setters, so an export
+    // can never be driven harder than the monitoring path.
+    const float clampedInputGainDb = GlobalGain::clampDb(inputGainDb);
+    const float clampedOutputGainDb = GlobalGain::clampDb(outputGainDb);
+    LOGI("Global gains: input %.2f dB, output %.2f dB",
+         clampedInputGainDb, clampedOutputGainDb);
 
     // Read input file
     std::vector<float> inputSamples;
@@ -98,8 +107,18 @@ bool OfflineProcessor::processFile(
         outputPtrs[0] = outputLeft.data();
         outputPtrs[1] = outputRight.data();
 
+        // Global input gain before the chain, in the same position as
+        // AudioEngine::onAudioReady, so the plugins see the drive the player hears.
+        applyConstantGainDb(inputLeft.data(), inputRight.data(),
+                            static_cast<int32_t>(framesToProcess), clampedInputGainDb);
+
         // Process
         chain_.process(inputPtrs, outputPtrs, static_cast<uint32_t>(framesToProcess));
+
+        // Global output gain after the chain, before the file is written, so the
+        // export matches what the (post-gain) output metering and recorder see.
+        applyConstantGainDb(outputLeft.data(), outputRight.data(),
+                            static_cast<int32_t>(framesToProcess), clampedOutputGainDb);
 
         // Interleave output
         for (size_t i = 0; i < framesToProcess; ++i) {

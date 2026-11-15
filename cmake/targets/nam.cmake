@@ -24,6 +24,40 @@ set(_nam_build   "${PROJECT_ROOT}/build/nam")
 set(_nam_assets  "${ASSETS_DIR}/neural_amp_modeler.lv2")
 set(_nam_lv2_id  "http://github.com/mikeoliphant/neural-amp-modeler-lv2")
 
+# 3rd_party/patches/neural-amp-modeler-lv2 in name order (also applied by
+# build.sh): Android platform compat, then the amp control ports + DSP and their
+# TTL/modgui declaration.
+set(_nam_patches
+    "${THIRD_PARTY}/patches/neural-amp-modeler-lv2/0001-android-platform-compat.patch"
+    "${THIRD_PARTY}/patches/neural-amp-modeler-lv2/0002-amp-controls-dsp.patch"
+    "${THIRD_PARTY}/patches/neural-amp-modeler-lv2/0003-amp-controls-modgui.patch"
+)
+
+# ─── Phase 0: Apply the patches (configure time) ─────────────────────────────
+# Phase 1 reads and copies the resources while CMake configures, but the
+# ExternalProject below applies 3rd_party/patches only while it builds. On a
+# pristine checkout - ./build.sh native never runs do_patch, and neither does a
+# bare `cmake --preset android-arm64` - that order would stage the unpatched
+# resources: a TTL declaring 3 control ports and a 2-knob modgui next to a
+# 12-port .so, repaired only by the next configure. Apply them here first.
+# scripts/apply-patches.sh is idempotent: "applied" when the patch is already in
+# the tree, "patched" when it applies now, an error when it fits neither.
+if(IS_DIRECTORY "${_nam_src}")
+    foreach(_nam_patch IN LISTS _nam_patches)
+        execute_process(
+            COMMAND bash "${PROJECT_ROOT}/scripts/apply-patches.sh" "${_nam_patch}" "${_nam_src}"
+            RESULT_VARIABLE _nam_patch_status
+            OUTPUT_VARIABLE _nam_patch_stdout
+            ERROR_VARIABLE  _nam_patch_stderr
+        )
+        if(NOT _nam_patch_status EQUAL 0)
+            message(FATAL_ERROR "nam.cmake: cannot apply ${_nam_patch} to ${_nam_src}:\n"
+                                "${_nam_patch_stdout}${_nam_patch_stderr}")
+        endif()
+        message(STATUS "NAM ${_nam_patch_stdout}")
+    endforeach()
+endif()
+
 # ─── Phase 1: Process TTL templates ──────────────────────────────────────────
 file(MAKE_DIRECTORY "${_nam_assets}")
 
@@ -72,13 +106,22 @@ endif()
 # ─── Phase 2: CMake cross-compile ────────────────────────────────────────────
 set(_nam_so_output "${_nam_build}/neural_amp_modeler.lv2/neural_amp_modeler.so")
 
+# The build-time pass over the same patches: ExternalProject may re-clone or
+# refresh <SOURCE_DIR>, and build.sh's do_patch leaves them applied anyway.
+# PATCH_COMMAND introduces the first command only, every later one needs its
+# own COMMAND separator; build the whole sequence and drop the trailing one.
+set(_nam_patch_commands PATCH_COMMAND)
+foreach(_nam_patch IN LISTS _nam_patches)
+    list(APPEND _nam_patch_commands bash "${PROJECT_ROOT}/scripts/apply-patches.sh" "${_nam_patch}" "<SOURCE_DIR>")
+    list(APPEND _nam_patch_commands COMMAND)
+endforeach()
+list(POP_BACK _nam_patch_commands)
+
 ExternalProject_Add(nam_build
     SOURCE_DIR      "${_nam_src}"
     BINARY_DIR      "${_nam_build}"
     INSTALL_DIR     "${_nam_assets}"
-    # Android platform compat (also applied by build.sh; skipped when present).
-    PATCH_COMMAND   bash "${PROJECT_ROOT}/scripts/apply-patches.sh"
-                        "${THIRD_PARTY}/patches/neural-amp-modeler-lv2/0001-android-platform-compat.patch" <SOURCE_DIR>
+    ${_nam_patch_commands}
     CMAKE_ARGS
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}

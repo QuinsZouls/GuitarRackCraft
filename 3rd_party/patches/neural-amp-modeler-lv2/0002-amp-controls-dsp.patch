@@ -1,0 +1,463 @@
+diff --git a/src/amp_controls.h b/src/amp_controls.h
+new file mode 100644
+index 0000000..dcd5ec3
+--- /dev/null
++++ b/src/amp_controls.h
+@@ -0,0 +1,325 @@
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++// Amplifier tone controls for the NAM LV2 plugin: gain/3-band EQ/presence.
++// Header-only and dependency-free (only <cmath>/<cstdint>/<cstring>/<limits>)
++// so it can be unit tested on the host without building the plugin. Nothing
++// here allocates, throws or calls into a virtual function: it is safe on the
++// audio thread. Every control value is sanitized on entry, so a corrupt preset
++// (NaN/Inf) cannot poison the filter state or the coefficients.
++
++namespace nam_dsp {
++
++constexpr float kPi = 3.14159265358979323846f;
++
++// Sample rate the voicing frequencies are designed for, and the fraction of the
++// real rate a band is allowed to reach (0.45 leaves the corner below Nyquist).
++constexpr float kDefaultSampleRateHz = 48000.0f;
++constexpr float kMaxFrequencyRatio = 0.45f;
++
++// Bit-level finite test on purpose: the plugin is built with -Ofast, which
++// enables -ffinite-math-only and lets the compiler fold std::isfinite() to
++// `true`, i.e. every sanitization below would silently disappear from the
++// shipped binary. Reading the exponent bits is immune to that.
++inline bool isFinite(float value) noexcept {
++	std::uint32_t bits = 0;
++	std::memcpy(&bits, &value, sizeof(bits));
++
++	return (bits & 0x7f800000u) != 0x7f800000u;
++}
++
++enum class BiquadKind {
++	kLowShelf,
++	kPeak,
++	kHighShelf
++};
++
++struct BiquadVoicing {
++	BiquadKind kind;
++	float frequencyHz;
++	float q;
++};
++
++// Transposed direct form II biquad (same topology as the in-tree
++// aidadsp-lv2 common/Biquad.h), coefficients computed with the RBJ audio EQ
++// cookbook formulas and normalized by a0.
++class Biquad {
++public:
++	// Anything below this is treated as zero: keeps a decaying filter from
++	// parking in the denormal range if the host never enabled FTZ/DAZ.
++	static constexpr float kDenormalThreshold = 1e-15f;
++
++	void setIdentity() noexcept {
++		b0_ = 1.0f;
++		b1_ = 0.0f;
++		b2_ = 0.0f;
++		a1_ = 0.0f;
++		a2_ = 0.0f;
++	}
++
++	void reset() noexcept {
++		z1_ = 0.0f;
++		z2_ = 0.0f;
++	}
++
++	void set(const BiquadVoicing& voicing, float sampleRate, float gainDb) noexcept;
++
++	float process(float in) noexcept {
++		const float out = b0_ * in + z1_;
++		const float nextZ1 = b1_ * in - a1_ * out + z2_;
++		const float nextZ2 = b2_ * in - a2_ * out;
++
++		if (isFinite(nextZ1) && isFinite(nextZ2)) {
++			z1_ = flushDenormal(nextZ1);
++			z2_ = flushDenormal(nextZ2);
++		}
++		else {
++			// A NaN sample or an accumulator overflow must not leave anything
++			// behind. Zeroing only the offending state would keep the other one at
++			// 1e38 and turn the filter into a spike generator: both states go.
++			z1_ = 0.0f;
++			z2_ = 0.0f;
++		}
++
++		return out;
++	}
++
++	// Reports a non-finite state as infinite instead of hiding it: fmax()
++	// silently discards a NaN operand, which would make a poisoned filter look
++	// healthy to both the tests and the plugin.
++	float maxAbsState() const noexcept {
++		const float magnitude = std::fmax(std::fabs(z1_), std::fabs(z2_));
++
++		return isFinite(magnitude) ? magnitude : std::numeric_limits<float>::infinity();
++	}
++
++private:
++	// Flushes denormals so a decaying filter cannot park in the subnormal range
++	// when the host did not enable FTZ/DAZ.
++	static float flushDenormal(float z) noexcept {
++		return std::fabs(z) >= kDenormalThreshold ? z : 0.0f;
++	}
++
++	float b0_ = 1.0f;
++	float b1_ = 0.0f;
++	float b2_ = 0.0f;
++	float a1_ = 0.0f;
++	float a2_ = 0.0f;
++	float z1_ = 0.0f;
++	float z2_ = 0.0f;
++};
++
++inline void Biquad::set(const BiquadVoicing& voicing, float sampleRate, float gainDb) noexcept {
++	if (!isFinite(gainDb))
++		gainDb = 0.0f;
++
++	if (gainDb == 0.0f) {
++		// Exact unity: keeps existing presets (all new ports at their 0 dB
++		// default) a bit-identical passthrough instead of "almost 1.0".
++		setIdentity();
++		return;
++	}
++
++	const double rate = isFinite(sampleRate) && sampleRate > 0.0f
++		? static_cast<double>(sampleRate) : static_cast<double>(kDefaultSampleRateHz);
++	// A band placed above Nyquist has no stable biquad: keep every centre below
++	// it. The clamp never engages at a real rate (0.45 * 8000 Hz is still above
++	// the highest band, 2 kHz), so it cannot move any voicing.
++	const double corner = std::fmin(static_cast<double>(voicing.frequencyHz), kMaxFrequencyRatio * rate);
++	const double a = std::pow(10.0, static_cast<double>(gainDb) / 40.0);
++	const double w0 = 2.0 * static_cast<double>(kPi) * corner / rate;
++	const double cosW0 = std::cos(w0);
++	const double alpha = std::sin(w0) / (2.0 * static_cast<double>(voicing.q));
++	const double twoSqrtAAlpha = 2.0 * std::sqrt(a) * alpha;
++
++	double b0 = 1.0;
++	double b1 = 0.0;
++	double b2 = 0.0;
++	double a0 = 1.0;
++	double a1 = 0.0;
++	double a2 = 0.0;
++
++	switch (voicing.kind) {
++		case BiquadKind::kLowShelf:
++			b0 = a * ((a + 1.0) - (a - 1.0) * cosW0 + twoSqrtAAlpha);
++			b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cosW0);
++			b2 = a * ((a + 1.0) - (a - 1.0) * cosW0 - twoSqrtAAlpha);
++			a0 = (a + 1.0) + (a - 1.0) * cosW0 + twoSqrtAAlpha;
++			a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cosW0);
++			a2 = (a + 1.0) + (a - 1.0) * cosW0 - twoSqrtAAlpha;
++			break;
++
++		case BiquadKind::kPeak:
++			b0 = 1.0 + alpha * a;
++			b1 = -2.0 * cosW0;
++			b2 = 1.0 - alpha * a;
++			a0 = 1.0 + alpha / a;
++			a1 = -2.0 * cosW0;
++			a2 = 1.0 - alpha / a;
++			break;
++
++		case BiquadKind::kHighShelf:
++			b0 = a * ((a + 1.0) + (a - 1.0) * cosW0 + twoSqrtAAlpha);
++			b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cosW0);
++			b2 = a * ((a + 1.0) + (a - 1.0) * cosW0 - twoSqrtAAlpha);
++			a0 = (a + 1.0) - (a - 1.0) * cosW0 + twoSqrtAAlpha;
++			a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cosW0);
++			a2 = (a + 1.0) - (a - 1.0) * cosW0 - twoSqrtAAlpha;
++			break;
++	}
++
++	const double invA0 = 1.0 / a0;
++	b0_ = static_cast<float>(b0 * invA0);
++	b1_ = static_cast<float>(b1 * invA0);
++	b2_ = static_cast<float>(b2 * invA0);
++	a1_ = static_cast<float>(a1 * invA0);
++	a2_ = static_cast<float>(a2 * invA0);
++}
++
++// bass -> mid -> treble -> presence, post-model and pre-output-level, with the
++// frequencies/Q of the in-tree aidadsp-lv2 rt-neural-generic defaults.
++class AmpToneStack {
++public:
++	enum Band : int {
++		kBass = 0,
++		kMid = 1,
++		kTreble = 2,
++		kPresence = 3
++	};
++
++	static constexpr int kBandCount = 4;
++	// Per-block smoothing of the dB targets: 25 % of the remaining distance per
++	// block. A full 12 dB step settles (to within 1e-4 dB) after 41 blocks: 55 ms
++	// at 64 frames, 109 ms at 128, 219 ms at 256. What matters is that no single
++	// block jumps to the target - that step is what would click.
++	static constexpr float kSmoothingCoefficient = 0.25f;
++	static constexpr float kSettledDeltaDb = 1e-4f;
++	static constexpr float kDefaultSampleRate = kDefaultSampleRateHz;
++
++	static const BiquadVoicing& voicing(int band) noexcept {
++		static constexpr BiquadVoicing kVoiceings[kBandCount] = {
++			{BiquadKind::kLowShelf, 305.0f, 0.707f},
++			{BiquadKind::kPeak, 750.0f, 0.707f},
++			{BiquadKind::kHighShelf, 2000.0f, 0.707f},
++			{BiquadKind::kHighShelf, 900.0f, 0.707f},
++		};
++		return kVoiceings[band < 0 ? 0 : (band >= kBandCount ? kBandCount - 1 : band)];
++	}
++
++	void setSampleRate(float sampleRate) noexcept {
++		sampleRate_ = isFinite(sampleRate) && sampleRate > 0.0f ? sampleRate : kDefaultSampleRate;
++		for (int band = 0; band < kBandCount; ++band)
++			updateBand(band);
++	}
++
++	float sampleRate() const noexcept {
++		return sampleRate_;
++	}
++
++	// Non-finite values (a corrupt or hand-edited preset, NaN reaching us
++	// through the LV2 control port) fall back to 0 dB: a NaN target would
++	// otherwise reach the RBJ formulas and leave every coefficient - and the
++	// filter state - NaN for the rest of the session.
++	void setTargets(float bassDb, float midDb, float trebleDb, float presenceDb) noexcept {
++		targetDb_[kBass] = sanitizeDb(bassDb);
++		targetDb_[kMid] = sanitizeDb(midDb);
++		targetDb_[kTreble] = sanitizeDb(trebleDb);
++		targetDb_[kPresence] = sanitizeDb(presenceDb);
++	}
++
++	static float sanitizeDb(float db) noexcept {
++		return isFinite(db) ? db : 0.0f;
++	}
++
++	void process(float* samples, uint32_t count) noexcept {
++		if (samples == nullptr || count == 0)
++			return;
++
++		advanceSmoothing();
++
++		for (int band = 0; band < kBandCount; ++band) {
++			Biquad& filter = bands_[band];
++
++			for (uint32_t i = 0; i < count; ++i)
++				samples[i] = filter.process(samples[i]);
++		}
++	}
++
++	// Runs the cascade on zeros: the damping state keeps decaying (and the
++	// smoothing keeps advancing) while the plugin is smart-bypassed, so that
++	// resuming is click-free. The output is discarded.
++	void processSilence(uint32_t count) noexcept {
++		if (count == 0)
++			return;
++
++		advanceSmoothing();
++
++		for (int band = 0; band < kBandCount; ++band) {
++			Biquad& filter = bands_[band];
++
++			for (uint32_t i = 0; i < count; ++i)
++				filter.process(0.0f);
++		}
++	}
++
++	void reset() noexcept {
++		for (int band = 0; band < kBandCount; ++band)
++			bands_[band].reset();
++	}
++
++	float gainDb(Band band) const noexcept {
++		return currentDb_[band];
++	}
++
++	float targetDb(Band band) const noexcept {
++		return targetDb_[band];
++	}
++
++	bool isSettled() const noexcept {
++		for (int band = 0; band < kBandCount; ++band) {
++			if (currentDb_[band] != targetDb_[band])
++				return false;
++		}
++		return true;
++	}
++
++	float maxAbsState() const noexcept {
++		float maxState = 0.0f;
++
++		for (int band = 0; band < kBandCount; ++band)
++			maxState = std::fmax(maxState, bands_[band].maxAbsState());
++
++		return maxState;
++	}
++
++private:
++	void advanceSmoothing() noexcept {
++		for (int band = 0; band < kBandCount; ++band) {
++			const float delta = targetDb_[band] - currentDb_[band];
++
++			if (std::fabs(delta) > kSettledDeltaDb) {
++				currentDb_[band] += kSmoothingCoefficient * delta;
++				updateBand(band);
++			}
++			else if (delta != 0.0f) {
++				currentDb_[band] = targetDb_[band];
++				updateBand(band);
++			}
++		}
++	}
++
++	void updateBand(int band) noexcept {
++		bands_[band].set(voicing(band), sampleRate_, currentDb_[band]);
++	}
++
++	Biquad bands_[kBandCount] = {};
++	float targetDb_[kBandCount] = {};
++	float currentDb_[kBandCount] = {};
++	float sampleRate_ = kDefaultSampleRate;
++};
++
++} // namespace nam_dsp
+diff --git a/src/nam_plugin.cpp b/src/nam_plugin.cpp
+index fceab2a..2456951 100644
+--- a/src/nam_plugin.cpp
++++ b/src/nam_plugin.cpp
+@@ -12,6 +12,18 @@
+ #endif
+ 
+ namespace NAM {
++	// A host connects every declared port, but the tone-control ports may be
++	// missing while the bundle's TTL lags behind this binary: read them as 0 dB
++	// (unity) instead of dereferencing a null pointer. A non-finite value (a
++	// corrupt preset) is read as unity too, so a single bad control cannot lock
++	// the gain or the tone stack into NaN for the rest of the session.
++	static float controlValue(const float* port) noexcept
++	{
++		const float value = port != nullptr ? *port : 0.0f;
++
++		return nam_dsp::isFinite(value) ? value : 0.0f;
++	}
++
+ 	Plugin::Plugin()
+ 	{
+ 		// prevent allocations on the audio thread
+@@ -45,6 +57,8 @@ namespace NAM {
+ 	{
+ 		this->sampleRate = sampleRate;
+ 
++		toneStack.setSampleRate(static_cast<float>(sampleRate));
++
+ 		// for fetching initial options, can be null
+ 		LV2_Options_Option* options = nullptr;
+ 
+@@ -264,6 +278,11 @@ namespace NAM {
+ 			}
+ 		}
+ 
++		toneStack.setTargets(controlValue(ports.bass), controlValue(ports.mid),
++			controlValue(ports.treble), controlValue(ports.presence));
++
++		const float toneGainDB = controlValue(ports.gain);
++
+ 		float level;
+ 
+ 		float modelInputAdjustmentDB = 0;
+@@ -300,6 +319,11 @@ namespace NAM {
+ 							ports.audio_out[i] = ports.audio_in[i];
+ 						}
+ 
++						// Let the tone stack decay on zeroes (its output is discarded, the
++						// filters only run to keep their state - and the parameter smoothing
++						// - in step with the knobs, so that resuming is click-free)
++						toneStack.processSilence(n_samples);
++
+ 						return;
+ 					}
+ 
+@@ -311,8 +335,8 @@ namespace NAM {
+ #endif
+ 		}
+ 
+-		// convert input level from db
+-		float desiredInputLevel = powf(10, (*(ports.input_level) + modelInputAdjustmentDB) * 0.05f);
++		// convert input level from db, folding in the amp gain so that both knobs share one smoother
++		float desiredInputLevel = powf(10, (*(ports.input_level) + toneGainDB + modelInputAdjustmentDB) * 0.05f);
+ 
+ 		if (fabs(desiredInputLevel - inputLevel) > SMOOTH_EPSILON)
+ 		{
+@@ -346,6 +370,9 @@ namespace NAM {
+ 			modelLoudnessAdjustmentDB = currentModel->GetRecommendedOutputDBAdjustment();
+ 		}
+ 
++		// tone controls: post model, pre output level
++		toneStack.process(ports.audio_out, n_samples);
++
+ 		// Convert output level from db
+ 		float desiredOutputLevel = powf(10, (*(ports.output_level) + modelLoudnessAdjustmentDB) * 0.05f);
+ 
+@@ -358,7 +385,9 @@ namespace NAM {
+ 				// do very basic smoothing
+ 				level = (.99f * level) + (.01f * desiredOutputLevel);
+ 
+-				ports.audio_out[i] = ports.audio_out[i] * outputLevel;
++				// multiply by the ramped `level`: the stale `outputLevel` made the output
++				// jump by the whole remaining distance when the ramp ended
++				ports.audio_out[i] = ports.audio_out[i] * level;
+ 			}
+ 
+ 			outputLevel = level;
+diff --git a/src/nam_plugin.h b/src/nam_plugin.h
+index 9a8a9ca..9a3b8b8 100644
+--- a/src/nam_plugin.h
++++ b/src/nam_plugin.h
+@@ -23,6 +23,8 @@
+ 
+ #include <NeuralAudio/NeuralModel.h>
+ 
++#include "amp_controls.h"
++
+ #define PlUGIN_URI "http://github.com/mikeoliphant/neural-amp-modeler-lv2"
+ #define MODEL_URI PlUGIN_URI "#model"
+ 
+@@ -53,6 +55,9 @@ namespace NAM {
+ 
+ 	class Plugin {
+ 	public:
++		// The LV2 port index of a field is its position in this struct
++		// (connect_port does pointer arithmetic over it). New ports are only ever
++		// appended: hosts persist control values by numeric index.
+ 		struct Ports {
+ 			const LV2_Atom_Sequence* control;
+ 			LV2_Atom_Sequence* notify;
+@@ -61,6 +66,11 @@ namespace NAM {
+ 			float* input_level;
+ 			float* output_level;
+ 			float* quality_scale;
++			float* gain;
++			float* bass;
++			float* mid;
++			float* treble;
++			float* presence;
+ 		};
+ 
+ 		Ports ports = {};
+@@ -78,6 +88,8 @@ namespace NAM {
+ 		float prevDCOutput = 0;
+ 		float qualityScale = 1.0f;
+ 
++		nam_dsp::AmpToneStack toneStack;
++
+ 		Plugin();
+ 		~Plugin();
+ 

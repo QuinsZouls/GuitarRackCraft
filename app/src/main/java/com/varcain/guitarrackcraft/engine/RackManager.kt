@@ -67,6 +67,10 @@ object RackManager {
 
     fun getRackPlugins(): List<PluginInfo> = native.getRackPlugins()
 
-    fun processFile(inputFile: File, outputFile: File): Boolean =
-        native.processFile(inputFile, outputFile)
+    fun processFile(
+        inputFile: File,
+        outputFile: File,
+        inputGainDb: Float = AudioSettingsManager.DEFAULT_GAIN_DB,
+        outputGainDb: Float = AudioSettingsManager.DEFAULT_GAIN_DB
+    ): Boolean = native.processFile(inputFile, outputFile, inputGainDb, outputGainDb)
 }

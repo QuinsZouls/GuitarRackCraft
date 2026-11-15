@@ -77,6 +77,11 @@ bool AudioEngine::start(float sampleRate, int32_t inputDeviceId,
     chain_.setSampleRate(sampleRate_, callbackFrameCount_);
     chain_.activate();
 
+    // Start the gain ramps at their current targets so the very first callback
+    // plays at the requested gain instead of sliding in from the previous run.
+    inputGain_.snapTo(globalInputGainDb_.load());
+    outputGain_.snapTo(globalOutputGainDb_.load());
+
     isRunning_ = true;
     LOGI("start() EXIT tid=%ld Audio engine started at %.0f Hz", getTid(), sampleRate_);
     return true;
@@ -353,6 +358,10 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         }
     }
 
+    // Global input gain (post-gain gain staging: meters, recorder raw tap and
+    // the chain all see the gained signal). Applies to both mic and WAV input.
+    inputGain_.process(inputBuffer_.data(), numFrames, globalInputGainDb_.load());
+
     // Input peak metering and clipping
     float inputPeak = 0.0f;
     bool inputClip = false;
@@ -481,6 +490,11 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(
         }
         cpuLoad_.store(load);
     }
+
+    // Global output gain, after the chain/bypass branch and before output
+    // metering: bypassed (chainBypass_ / wavBypassChain_) audio is gained too.
+    outputGain_.process(outputBufferLeft_.data(), outputBufferRight_.data(), numFrames,
+                        globalOutputGainDb_.load());
 
     // Output peak metering (from buffers we wrote to)
     float outputPeak = 0.0f;
