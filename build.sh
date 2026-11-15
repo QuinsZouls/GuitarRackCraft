@@ -67,6 +67,28 @@ do_check() {
         fi
     done
 
+    # The doubletracker plugin: cmake/targets/doubletracker.cmake find_program()s
+    # faust REQUIRED at configure time, compiles the generated code against
+    # faust's LV2 architecture file, and that architecture includes
+    # boost/circular_buffer.hpp for the voice controls. Both the architecture
+    # file and the host's /usr/include/boost are referenced by fixed path (the
+    # latter is symlinked into the cross build), so they have to be there.
+    command -v faust > /dev/null || { echo "missing: faust" >&2; problems=1; }
+    [ -f /usr/share/faust/lv2.cpp ] || {
+        echo "missing: /usr/share/faust/lv2.cpp (faust's LV2 architecture;" \
+             "ships in faust on Debian, faust-devel on SUSE)" >&2
+        problems=1
+    }
+    [ -f /usr/include/boost/circular_buffer.hpp ] || {
+        echo "missing: boost/circular_buffer.hpp (libboost_headers-devel on SUSE," \
+             "libboost-dev on Debian)" >&2
+        problems=1
+    }
+    # ccache is optional - cmake/scripts/aidax_full_configure.sh.in skips it
+    # when it is absent - but a full native build takes far longer without it.
+    command -v ccache > /dev/null ||
+        echo "note: no ccache (supported, but the native build is much slower)"
+
     # cmake >= 3.26: ExternalProject INSTALL_BYPRODUCTS (cmake/CMakeLists.txt)
     if command -v cmake > /dev/null; then
         ver="$(cmake --version | awk 'NR == 1 { print $3 }')"

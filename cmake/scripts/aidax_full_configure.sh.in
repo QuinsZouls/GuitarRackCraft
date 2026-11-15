@@ -15,6 +15,11 @@ NDK_SYSROOT="@NDK_SYSROOT@"
 NDK_LIBDIR="@NDK_LIBDIR@"
 CCACHE_PROGRAM="@CCACHE_PROGRAM@"
 
+# CMake substitutes the literal string "CCACHE_PROGRAM-NOTFOUND" when ccache is
+# not installed. That is non-empty, so the -n test below would accept it and
+# configure the build with a launcher that cannot be executed.
+case "$CCACHE_PROGRAM" in *-NOTFOUND) CCACHE_PROGRAM="" ;; esac
+
 # Build ccache cmake args if ccache is available
 CCACHE_ARGS=""
 if [ -n "$CCACHE_PROGRAM" ]; then
